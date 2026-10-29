@@ -18,9 +18,11 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _busy = false;
   String? _error;
 
-  /// 底部「服务器设置」上显示的版本信息
-  String get _versionLabel =>
-      Api.i.version.isEmpty ? '未连接' : 'v${Api.i.version}';
+  /// 底部「服务器设置」上显示的版本信息：
+  /// 前面是 App 自身版本（来自 theme.dart 的 kAppVersion），后面是站点版本
+  String get _versionLabel => Api.i.version.isEmpty
+      ? 'v$kAppVersion · 未连接'
+      : 'v$kAppVersion · 站点 ${Api.i.version}';
 
   @override
   void dispose() {

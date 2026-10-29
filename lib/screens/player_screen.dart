@@ -8,6 +8,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:screen_brightness/screen_brightness.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../api.dart';
 import '../asset_paths.dart';
 
 /// lanerc 风格播放页（M2 皮肤 + 手势）
@@ -45,9 +46,26 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   final List<StreamSubscription<dynamic>> _subs = <StreamSubscription<dynamic>>[];
 
-  bool _landscape = true;
+  bool _landscape = false;
   String? _error;
   double _speed = 1.0;
+
+  /// 是否已经真正出画（出过画面就不再显示加载浮层）
+  bool _started = false;
+  /// 起播超过 10 秒还没出画
+  bool _slow = false;
+  /// libmpv 正在缓冲（网络抖动或拖动后重新取流）
+  bool _buffering = false;
+  Timer? _slowTimer;
+  /// 进度条/时间文本专用：拖动时是目标位置，否则是真实位置。
+  /// 用它做局部重建，替代"整树 setState"——那才是进度条看起来不跟手的根因（节流期间不刷新）。
+  final ValueNotifier<Duration> _uiPos = ValueNotifier<Duration>(Duration.zero);
+  /// 是否正在手动拖动底部进度条（拖动中只更新显示，松手才真正 seek）
+  bool _seekingSlider = false;
+  /// 是否已切到 /api/proxy 代理线路（只切一次，避免死循环）
+  bool _viaProxy = false;
+  /// 拖动时进度条重绘节流
+  int _lastSeekUiAt = 0;
 
   late int _index;
   late String _url;
@@ -93,6 +111,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _index = widget.index;
     _url = widget.url;
     _player = Player();
+    _applyMpvTuning();
     _controller = VideoController(
       _player,
       configuration: const VideoControllerConfiguration(
@@ -101,22 +120,116 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
 
     _subs.add(_player.stream.error.listen((String e) {
-      if (mounted) setState(() => _error = e);
+      if (!mounted) return;
+      // 直连源站失败时自动走同源代理（和 Web 端 hls.js 的策略一致），只重试一次
+      if (!_viaProxy) {
+        _viaProxy = true;
+        setState(() {
+          _error = null;
+          _started = false;
+          _slow = false;
+        });
+        _uiPos.value = Duration.zero;
+        _showHud('直连失败，正在切换代理线路…', ms: 1600);
+        _armSlowTimer(seconds: 12);
+        unawaited(_openCurrent());
+        return;
+      }
+      setState(() => _error = e);
     }));
-    _subs.add(_player.stream.position.listen((Duration v) => _pos = v));
-    _subs.add(_player.stream.duration.listen((Duration v) => _dur = v));
-    _subs.add(_player.stream.playing.listen((bool v) => _playing = v));
+    _subs.add(_player.stream.position.listen((Duration v) {
+      _pos = v;
+      if (!_seekingSlider && _mode != _Mode.seek) _uiPos.value = v;
+      // 真正的"出画"判据是时间轴开始前进。
+      // libmpv 的 playing 事件在首帧之前就为 true，用它判断会让加载浮层刚显示就被收掉，
+      // 用户看到的就是"一直黑屏、没有任何加载提示"。
+      if (!_started && v > const Duration(milliseconds: 250)) {
+        _started = true;
+        _slow = false;
+        _slowTimer?.cancel();
+        if (mounted) setState(() {});
+      }
+    }));
+    _subs.add(_player.stream.duration.listen((Duration v) {
+      if (!mounted) return;
+      setState(() => _dur = v);
+    }));
+    _subs.add(_player.stream.playing.listen((bool v) {
+      if (!mounted) return;
+      setState(() => _playing = v);
+    }));
+    _subs.add(_player.stream.buffering.listen((bool v) {
+      if (mounted) setState(() => _buffering = v);
+    }));
     _subs.add(_player.stream.volume.listen((double v) => _vol = v));
     _subs.add(_player.stream.rate.listen((double v) => _rate = v));
 
-    unawaited(_player.open(Media(widget.url)));
+    unawaited(_openCurrent());
     unawaited(WakelockPlus.enable());
     unawaited(_initBrightness());
     _restartHideTimer();
-    // 进入播放页即横屏全屏：等首帧后再转，避免个别机型转屏失败
+    // 默认竖屏播放：点全屏键才转横屏。
+    // 关键：锁屏放到首帧之后再补一次 —— Android 12+ 在 initState 阶段 Activity 可能还没 attach，
+    // 只在 initState 调一次会被系统静默丢弃，表现就是"点播放自己变横屏"。
+    unawaited(_lockPortrait());
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(_enterFullscreen());
+      if (mounted) unawaited(_lockPortrait());
     });
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    // 起播慢时给个"不是卡死"的交代（10 秒还没出画面就提示换源）
+    _armSlowTimer();
+  }
+
+  /// 锁竖屏（可被 initState / 首帧后 / 退出全屏复用）
+  Future<void> _lockPortrait() {
+    return SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+      DeviceOrientation.portraitUp,
+    ]);
+  }
+
+  /// 起播看门狗：到点还没出画就提示"加载较慢"
+  void _armSlowTimer({int seconds = 10}) {
+    _slowTimer?.cancel();
+    _slowTimer = Timer(Duration(seconds: seconds), () {
+      if (mounted && !_started) setState(() => _slow = true);
+    });
+  }
+
+  /// libmpv 调优：默认缓存很小，起播和 seek 都要重新连源站，
+  /// 这就是"同样片源 App 明显比 Web 慢"的主因（Web 走 hls.js + MSE，缓冲 120 秒）。
+  /// 用 dynamic 调用 setProperty：media_kit 各版本对 NativePlayer 的导出不完全一致，
+  /// 写死类型会让 CI 编译失败，这里失败也只是少了优化，不影响播放。
+  void _applyMpvTuning() {
+    final Map<String, String> props = <String, String>{
+      'cache': 'yes',
+      'cache-secs': '60',
+      'demuxer-max-bytes': '67108864', // 64MiB
+      'demuxer-max-back-bytes': '33554432', // 32MiB
+      'demuxer-readahead-secs': '30',
+      'hwdec': 'auto-safe',
+      'network-timeout': '15',
+    };
+    unawaited(() async {
+      try {
+        final dynamic np = _player.platform;
+        for (final MapEntry<String, String> e in props.entries) {
+          try {
+            await np.setProperty(e.key, e.value);
+          } catch (_) {
+            // 个别属性在当前 libmpv 版本不存在，忽略
+          }
+        }
+      } catch (_) {
+        // 拿不到原生播放器（理论上不会），放弃调优
+      }
+    }());
+  }
+
+  /// 打开当前剧集：直连失败过一次就改用代理地址
+  Future<void> _openCurrent() async {
+    if (!mounted) return;
+    final String target = _viaProxy ? Api.i.proxyUrl(_url) : _url;
+    await _player.open(Media(target));
   }
 
   bool get _hasEpisodes => widget.episodes.length > 1;
@@ -134,9 +247,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _error = null;
       _pos = Duration.zero;
       _dur = Duration.zero;
+      _started = false;
+      _slow = false;
+      _viaProxy = false;
+      _seekingSlider = false;
     });
+    _uiPos.value = Duration.zero;
+    _armSlowTimer();
     await _player.setRate(_speed);
-    await _player.open(Media(_url));
+    await _openCurrent();
     _restartHideTimer();
     _showHud('第${i + 1}集');
   }
@@ -155,10 +274,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _hideTimer?.cancel();
     _tapTimer?.cancel();
     _hudTimer?.cancel();
+    _slowTimer?.cancel();
     for (final StreamSubscription<dynamic> s in _subs) {
       unawaited(s.cancel());
     }
     _hud.dispose();
+    _uiPos.dispose();
     unawaited(WakelockPlus.disable());
     unawaited(_player.dispose());
     unawaited(
@@ -265,7 +386,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _showHud(_locked ? '已锁定' : '已解锁');
   }
 
-  /// 进入横屏全屏（进播放页就调它，符合"点开即全屏横屏"的手感）
+  /// 进入横屏全屏（只由全屏键/横屏控件调用，进播放页不再自动转屏）
   Future<void> _enterFullscreen() async {
     await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
       DeviceOrientation.landscapeLeft,
@@ -363,6 +484,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         final String sign = secs >= 0 ? '+' : '';
         _showHud('$sign${secs.round()}s · ${_fmt(_seekTarget)}', ms: 600);
       }
+      // 进度条跟手：只更新进度条自己的 notifier，不重建整棵树
+      if (now - _lastSeekUiAt > 40) {
+        _lastSeekUiAt = now;
+        _uiPos.value = _seekTarget;
+      }
       return;
     }
 
@@ -396,11 +522,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
       unawaited(_player.setRate(_baseRate));
       _showHud('已恢复');
     } else if (_mode == _Mode.seek) {
+      // 先把显示对齐到目标位置再发 seek：否则松手瞬间进度条会先"回跳"到旧位置再跳回来
+      _pos = _seekTarget;
+      _uiPos.value = _seekTarget;
       unawaited(_player.seek(_seekTarget));
     } else if (_mode == _Mode.pending) {
       _handleTap();
     }
     _mode = _Mode.idle;
+    // 拖动结束后让进度条回到真实播放位置
+    if (mounted) setState(() {});
     if (_controlsVisible && !_locked) _restartHideTimer();
   }
 
@@ -578,12 +709,57 @@ class _PlayerScreenState extends State<PlayerScreen> {
               child: const SizedBox.expand(),
             ),
           ),
+          _buildLoading(),
           _buildTopBar(),
           _buildBottomBar(),
           _buildLockButton(),
           if (_error != null) _buildError(),
           _buildHud(),
         ],
+      ),
+    );
+  }
+
+  /// 起播/缓冲浮层：黑屏期间明确告知"在加载"，避免误判资源失效。
+  /// 做成整屏压暗 + 居中大字：之前只有一个小半透明方块，叠在黑色视频上几乎看不见。
+  Widget _buildLoading() {
+    final bool show = !_started || _buffering;
+    if (!show || _error != null) return const SizedBox.shrink();
+    final String text = _buffering && _started
+        ? '缓冲中…'
+        : (_slow ? '加载较慢，可换一集或换源' : '正在加载…');
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: ColoredBox(
+          color: const Color(0x4D000000),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                const SizedBox(
+                  width: 34,
+                  height: 34,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.6,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  text,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    shadows: <Shadow>[
+                      Shadow(color: Color(0x99000000), blurRadius: 6),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -678,41 +854,66 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  Widget _progressRow() {
-    final double rawMax = _dur.inMilliseconds.toDouble();
-    final double max = rawMax > 0 ? rawMax : 1.0;
-    final double value = _pos.inMilliseconds.toDouble().clamp(0.0, max);
-
-    return Row(
-      children: <Widget>[
-        Text(
-          _fmt(_pos),
-          style: const TextStyle(color: Colors.white, fontSize: 12),
-        ),
-        Expanded(
-          child: SliderTheme(
-            data: SliderThemeData(
-              trackHeight: 3,
-              activeTrackColor: Colors.white,
-              inactiveTrackColor: Colors.white24,
-              thumbColor: Colors.white,
-              overlayColor: Colors.white24,
-              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
-              overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+  /// 进度条（横竖屏共用）
+  ///
+  /// 之前的坑：Slider 是"受控组件"，value 绑的是 200ms 节流后的播放位置，而 onChanged
+  /// 每一帧都在发 seek —— 手指滑到哪、滑块被拉回旧位置，越拖越乱，还让 libmpv 反复重建缓冲。
+  /// 现在：拖动期间只更新本地显示（_uiPos + _seekingSlider），松手才发一次 seek。
+  Widget _progressBlock({required bool withFullscreen}) {
+    return ValueListenableBuilder<Duration>(
+      valueListenable: _uiPos,
+      builder: (BuildContext context, Duration shown, Widget? _) {
+        final double max =
+            _dur.inMilliseconds > 0 ? _dur.inMilliseconds.toDouble() : 1.0;
+        final double value = shown.inMilliseconds.toDouble().clamp(0.0, max);
+        return Row(
+          children: <Widget>[
+            Text(
+              _fmt(shown),
+              style: const TextStyle(color: Colors.white, fontSize: 12),
             ),
-            child: Slider(
-              value: value,
-              max: max,
-              onChanged: (double v) =>
-                  _player.seek(Duration(milliseconds: v.round())),
+            Expanded(
+              child: SliderTheme(
+                data: SliderThemeData(
+                  trackHeight: 3,
+                  activeTrackColor: Colors.white,
+                  inactiveTrackColor: Colors.white24,
+                  thumbColor: Colors.white,
+                  overlayColor: Colors.white24,
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                ),
+                child: Slider(
+                  value: value,
+                  max: max,
+                  onChangeStart: (double v) {
+                    _seekingSlider = true;
+                    _hideTimer?.cancel();
+                  },
+                  onChanged: (double v) {
+                    _uiPos.value = Duration(
+                      milliseconds: v.round().clamp(0, max.round()).toInt(),
+                    );
+                  },
+                  onChangeEnd: (double v) {
+                    final Duration t = Duration(milliseconds: v.round());
+                    _seekingSlider = false;
+                    _pos = t;
+                    _uiPos.value = t;
+                    unawaited(_player.seek(t));
+                    _restartHideTimer();
+                  },
+                ),
+              ),
             ),
-          ),
-        ),
-        Text(
-          _fmt(_dur),
-          style: const TextStyle(color: Colors.white70, fontSize: 12),
-        ),
-      ],
+            Text(
+              _fmt(_dur),
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+            if (withFullscreen) _iconBtn('full', 22, _toggleFullscreen),
+          ],
+        );
+      },
     );
   }
 
@@ -720,7 +921,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        _progressRow(),
+        _progressBlock(withFullscreen: false),
         Row(
           children: <Widget>[
             _iconBtn(
@@ -751,7 +952,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               },
             ),
             const SizedBox(width: 8),
-            Expanded(child: _danmakuPill()),
+            const Spacer(),
             _textBtn('${_speed}x', onTap: _showSpeedSheet),
             _textBtn('选集', onTap: _showEpisodeSheet),
             GestureDetector(
@@ -776,73 +977,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        Row(
-          children: <Widget>[
-            Text(
-              _fmt(_pos),
-              style: const TextStyle(color: Colors.white, fontSize: 12),
-            ),
-            Expanded(
-              child: SliderTheme(
-                data: SliderThemeData(
-                  trackHeight: 3,
-                  activeTrackColor: Colors.white,
-                  inactiveTrackColor: Colors.white24,
-                  thumbColor: Colors.white,
-                  overlayColor: Colors.white24,
-                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
-                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
-                ),
-                child: Slider(
-                  value: _pos.inMilliseconds
-                      .toDouble()
-                      .clamp(0.0, _dur.inMilliseconds > 0
-                          ? _dur.inMilliseconds.toDouble()
-                          : 1.0),
-                  max: _dur.inMilliseconds > 0
-                      ? _dur.inMilliseconds.toDouble()
-                      : 1.0,
-                  onChanged: (double v) =>
-                      _player.seek(Duration(milliseconds: v.round())),
-                ),
-              ),
-            ),
-            Text(
-              _fmt(_dur),
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-            _iconBtn('full', 22, _toggleFullscreen),
-          ],
-        ),
+        _progressBlock(withFullscreen: true),
       ],
-    );
-  }
-
-  Widget _danmakuPill() {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => _showHud('弹幕未开启'),
-      child: Container(
-        height: 34,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        decoration: BoxDecoration(
-          color: const Color(0x1FFFFFFF),
-          borderRadius: BorderRadius.circular(17),
-        ),
-        child: Row(
-          children: <Widget>[
-            const Expanded(
-              child: Text(
-                '发送一条友善的弹幕吧~',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: Colors.white54, fontSize: 12),
-              ),
-            ),
-            _svg('dm_open', 18, color: Colors.white70),
-          ],
-        ),
-      ),
     );
   }
 

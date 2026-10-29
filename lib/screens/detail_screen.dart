@@ -189,45 +189,6 @@ class _DetailScreenState extends State<DetailScreen> {
               ),
             ),
           ),
-          // 底部细进度条 + 全屏
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 6, 6),
-              child: Row(
-                children: <Widget>[
-                  const Text(
-                    '未播放',
-                    style: TextStyle(color: Colors.white70, fontSize: 11),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Container(
-                      height: 2.5,
-                      decoration: BoxDecoration(
-                        color: Colors.white24,
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  if (_detail != null)
-                    Text(
-                      '共 ${_detail!.episodes.length} 集',
-                      style: const TextStyle(
-                        color: Colors.white70,
-                        fontSize: 11,
-                      ),
-                    ),
-                  _topIcon(Icons.fullscreen_rounded, () {
-                    if (_detail != null) _play(0);
-                  }, size: 22),
-                ],
-              ),
-            ),
-          ),
         ],
       ),
     );
@@ -305,17 +266,6 @@ class _DetailScreenState extends State<DetailScreen> {
               ),
             ),
           const Spacer(),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: C.soft,
-              borderRadius: BorderRadius.circular(Metrics.pill),
-            ),
-            child: const Text(
-              '弹幕未开启',
-              style: TextStyle(color: C.muted, fontSize: 11),
-            ),
-          ),
         ],
       ),
     );
@@ -440,6 +390,22 @@ class _DetailScreenState extends State<DetailScreen> {
     );
   }
 
+  /// 源站简介里带 <p>/<br>&nbsp; 等标签，直接丢给 Text 会把尖括号原样显示出来
+  String _cleanDesc(String s) {
+    String t = s
+        .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
+        .replaceAll(RegExp(r'</p\s*>', caseSensitive: false), '\n\n')
+        .replaceAll(RegExp(r'<[^>]*>'), '')
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'");
+    t = t.replaceAll(RegExp(r'[ \t]+\n'), '\n').replaceAll(RegExp(r'\n{3,}'), '\n\n');
+    return t.trim();
+  }
+
   Widget _descBlock(String desc) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 18, 16, 0),
@@ -456,7 +422,7 @@ class _DetailScreenState extends State<DetailScreen> {
           ),
           const SizedBox(height: 8),
           Text(
-            desc,
+            _cleanDesc(desc),
             style: const TextStyle(
               color: C.sub,
               fontSize: 12.5,

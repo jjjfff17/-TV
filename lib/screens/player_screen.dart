@@ -10,6 +10,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../api.dart';
 import '../asset_paths.dart';
+import '../mpv_tuning.dart';
 
 /// lanerc 风格播放页（M2 皮肤 + 手势）
 /// 手势：轻横滑 ±4s / 长横滑 ±15s；竖滑音量亮度；双击播放暂停；长按 2x，上滑 3x，下滑 1.5x。
@@ -23,6 +24,9 @@ class PlayerScreen extends StatefulWidget {
     this.episodes = const <String>[],
     this.index = 0,
     this.sourceName,
+    this.player,
+    this.controller,
+    this.onEpisodeChanged,
   });
 
   final String url;
@@ -35,6 +39,14 @@ class PlayerScreen extends StatefulWidget {
   final int index;
 
   final String? sourceName;
+
+  /// 详情页内嵌播放器进全屏时复用同一个 Player / VideoController。
+  /// 传入后本页不再创建、也不再销毁播放器 —— 退出全屏不会打断播放，进度也不丢。
+  final Player? player;
+  final VideoController? controller;
+
+  /// 全屏里换集后回传，让详情页的选集高亮跟着变
+  final ValueChanged<int>? onEpisodeChanged;
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -110,14 +122,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.initState();
     _index = widget.index;
     _url = widget.url;
-    _player = Player();
-    _applyMpvTuning();
-    _controller = VideoController(
-      _player,
-      configuration: const VideoControllerConfiguration(
-        enableHardwareAcceleration: true,
-      ),
-    );
+    final bool own = widget.player == null;
+    _player = widget.player ?? Player();
+    if (own) {
+      applyMpvTuning(_player);
+      _controller = VideoController(
+        _player,
+        configuration: const VideoControllerConfiguration(
+          enableHardwareAcceleration: true,
+        ),
+      );
+    } else {
+      // 复用详情页的播放器：不新建原生实例
+      _controller = widget.controller!;
+    }
 
     _subs.add(_player.stream.error.listen((String e) {
       if (!mounted) return;
@@ -164,18 +182,43 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _subs.add(_player.stream.volume.listen((double v) => _vol = v));
     _subs.add(_player.stream.rate.listen((double v) => _rate = v));
 
-    unawaited(_openCurrent());
+    if (own) {
+      unawaited(_openCurrent());
+    } else {
+      // 复用外部播放器：不重新拉流，只把当前状态同步进来，
+      // 否则进全屏会黑一下再从头缓冲，肉眼就是"点了全屏卡两秒"。
+      _pos = _player.state.position;
+      _dur = _player.state.duration;
+      _playing = _player.state.playing;
+      _started = _pos > Duration.zero;
+      _uiPos.value = _pos;
+    }
     unawaited(WakelockPlus.enable());
     unawaited(_initBrightness());
     _restartHideTimer();
-    // 默认竖屏播放：点全屏键才转横屏。
-    // 关键：锁屏放到首帧之后再补一次 —— Android 12+ 在 initState 阶段 Activity 可能还没 attach，
-    // 只在 initState 调一次会被系统静默丢弃，表现就是"点播放自己变横屏"。
-    unawaited(_lockPortrait());
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(_lockPortrait());
-    });
-    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    if (own) {
+      // 独立进入播放页：默认竖屏，点全屏键才转横屏。
+      // 关键：首帧后再补锁一次 —— Android 12+ 在 initState 阶段 Activity 可能还没 attach，
+      // 只调一次会被系统静默丢弃，表现就是"点播放自己变横屏"。
+      unawaited(_lockPortrait());
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_lockPortrait());
+      });
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    } else {
+      // 从详情页内嵌播放器点全屏键进来：进来就该是横屏全屏，
+      // 不能让用户再点第二次全屏键。
+      _landscape = true;
+      unawaited(
+        SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+      );
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      );
+    }
     // 起播慢时给个"不是卡死"的交代（10 秒还没出画面就提示换源）
     _armSlowTimer();
   }
@@ -195,35 +238,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
-  /// libmpv 调优：默认缓存很小，起播和 seek 都要重新连源站，
-  /// 这就是"同样片源 App 明显比 Web 慢"的主因（Web 走 hls.js + MSE，缓冲 120 秒）。
-  /// 用 dynamic 调用 setProperty：media_kit 各版本对 NativePlayer 的导出不完全一致，
-  /// 写死类型会让 CI 编译失败，这里失败也只是少了优化，不影响播放。
-  void _applyMpvTuning() {
-    final Map<String, String> props = <String, String>{
-      'cache': 'yes',
-      'cache-secs': '60',
-      'demuxer-max-bytes': '67108864', // 64MiB
-      'demuxer-max-back-bytes': '33554432', // 32MiB
-      'demuxer-readahead-secs': '30',
-      'hwdec': 'auto-safe',
-      'network-timeout': '15',
-    };
-    unawaited(() async {
-      try {
-        final dynamic np = _player.platform;
-        for (final MapEntry<String, String> e in props.entries) {
-          try {
-            await np.setProperty(e.key, e.value);
-          } catch (_) {
-            // 个别属性在当前 libmpv 版本不存在，忽略
-          }
-        }
-      } catch (_) {
-        // 拿不到原生播放器（理论上不会），放弃调优
-      }
-    }());
-  }
+  /// libmpv 调优已抽到 ../mpv_tuning.dart，与详情页内嵌播放器共用同一份参数。
 
   /// 打开当前剧集：直连失败过一次就改用代理地址
   Future<void> _openCurrent() async {
@@ -254,6 +269,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
     _uiPos.value = Duration.zero;
     _armSlowTimer();
+    // 通知详情页同步选集高亮（全屏换集后返回，页面不能还停在旧集上）
+    widget.onEpisodeChanged?.call(i);
     await _player.setRate(_speed);
     await _openCurrent();
     _restartHideTimer();
@@ -280,8 +297,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     _hud.dispose();
     _uiPos.dispose();
-    unawaited(WakelockPlus.disable());
-    unawaited(_player.dispose());
+    // 只有自己创建的播放器才由本页销毁；
+    // 详情页传进来的播放器退出全屏后还要继续在页面里播，不能在这里 dispose。
+    if (widget.player == null) {
+      unawaited(WakelockPlus.disable());
+      unawaited(_player.dispose());
+    }
     unawaited(
       SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
         DeviceOrientation.portraitUp,
@@ -398,8 +419,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _restartHideTimer();
   }
 
-  /// 退出全屏：回到竖屏 + 恢复系统栏
+  /// 退出全屏：从详情页进来的，退出全屏就是关掉本页（回到内嵌播放器）；
+  /// 独立进入的，回到竖屏继续在本页看。
   Future<void> _exitFullscreen() async {
+    if (widget.player != null) {
+      if (mounted) Navigator.of(context).maybePop();
+      return;
+    }
     await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
       DeviceOrientation.portraitUp,
     ]);

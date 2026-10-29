@@ -1,7 +1,7 @@
 name: libretv_native
 description: LibreTV native Android client (Flutter + media_kit / libmpv)
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.3.0+3
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -13,6 +13,10 @@ dependencies:
   media_kit_video: ^2.0.1
   media_kit_libs_android_video: ^1.3.8
   dio: ^5.11.1
+  shared_preferences: ^2.5.0
+  screen_brightness: ^2.1.11
+  wakelock_plus: ^1.8.2
+  flutter_svg: ^2.3.2
 
 dev_dependencies:
   flutter_test:
@@ -21,3 +25,12 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  # 资源放在 lib/ 下：CI 只做 `cp -r lib`，无需额外拷贝步骤（少一步手动配置）
+  assets:
+    - lib/assets/lanerc/icons/
+  fonts:
+    - family: MiSans
+      fonts:
+        - asset: lib/assets/fonts/MiSans-Regular.ttf
+        - asset: lib/assets/fonts/MiSans-Demibold.ttf
+          weight: 600

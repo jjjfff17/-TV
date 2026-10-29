@@ -273,7 +273,7 @@ class Api {
     if (body == null) return;
 
     yield* body.stream
-        .transform(utf8.decoder)
+        .cast<List<int>>().transform(utf8.decoder)
         .transform(const LineSplitter())
         .where((String line) => line.trim().isNotEmpty)
         .map(_parseEvent)

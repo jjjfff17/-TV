@@ -214,7 +214,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   const SizedBox(height: 18),
                   TextButton(
                     onPressed: _openEndpointDialog,
-                    child: const Text(
+                    child:  Text(
                       '服务器设置（${Api.i.version.isEmpty ? '未连接' : 'v${Api.i.version}'}）',
                       style: TextStyle(color: Colors.white30, fontSize: 12),
                     ),

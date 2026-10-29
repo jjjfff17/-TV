@@ -14,6 +14,13 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// 流式搜索的一批结果：items 非空则渲染，done=true 表示所有源都跑完了
+class SearchEvent {
+  const SearchEvent(this.items, this.done);
+  final List<SearchItem> items;
+  final bool done;
+}
+
 /// LibreTV 后端客户端。
 ///
 /// 关键事实（已实测）：
@@ -233,10 +240,90 @@ class Api {
     return d;
   }
 
+  /// 流式聚合搜索：后端 `?stream=1` 用 NDJSON 逐源推送。
+  /// 实测冷缓存：首源 ~2.0s、中位 2.7s、全量 5.4s，所以边到边渲染比等全量快一半以上。
+  Stream<SearchEvent> searchStream(String wd) async* {
+    if (sources.isEmpty) {
+      await refreshStatus();
+    }
+    if (sources.isEmpty) {
+      throw ApiException('站点没有配置采集源（DEFAULT_SOURCES 为空）');
+    }
+    final Response<ResponseBody> r = await _request<ResponseBody>(
+      () => _dio.post<ResponseBody>(
+        '/api/search',
+        queryParameters: <String, dynamic>{..._query(), 'stream': '1'},
+        data: <String, dynamic>{
+          'wd': wd,
+          'sources': sources.map((SourceConfig s) => s.toJson()).toList(),
+          'filterAdult': true,
+        },
+        options: Options(
+          contentType: Headers.jsonContentType,
+          responseType: ResponseType.stream,
+          receiveTimeout: const Duration(seconds: 90),
+        ),
+      ),
+    );
+    _mergeCookies(r.headers.map['set-cookie']);
+    if (r.statusCode != 200) {
+      throw ApiException('搜索失败（HTTP ${r.statusCode}）');
+    }
+    final ResponseBody? body = r.data;
+    if (body == null) return;
+
+    yield* body.stream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .where((String line) => line.trim().isNotEmpty)
+        .map(_parseEvent)
+        .where((SearchEvent e) => e.items.isNotEmpty || e.done);
+  }
+
+  SearchEvent _parseEvent(String line) {
+    try {
+      final Object? raw = jsonDecode(line);
+      if (raw is! Map) return const SearchEvent(<SearchItem>[], false);
+      final Map<String, dynamic> m = Map<String, dynamic>.from(raw);
+      final String type = (m['type'] ?? '').toString();
+      if (type == 'done') {
+        final Object? list = m['list'];
+        if (list is List) {
+          return SearchEvent(_toItems(list), true);
+        }
+        return const SearchEvent(<SearchItem>[], true);
+      }
+      final Object? items = m['list'];
+      if (items is List) return SearchEvent(_toItems(items), false);
+    } catch (_) {
+      // 单行解析失败不影响后续
+    }
+    return const SearchEvent(<SearchItem>[], false);
+  }
+
+  List<SearchItem> _toItems(List<dynamic> list) => list
+      .whereType<Map>()
+      .map((Map e) => SearchItem.fromJson(Map<String, dynamic>.from(e)))
+      .where((SearchItem e) => e.name.isNotEmpty)
+      .toList();
+
+  /// 封面地址：豆瓣图有防盗链（无 Referer 418 / 错 UA 403），必须走自家代理；
+  /// 采集站的图可以直接加载。
+  String imageUrl(String raw) {
+    if (raw.isEmpty) return raw;
+    if (raw.contains('doubanio.com') || raw.contains('douban.com')) {
+      return proxyUrl(raw);
+    }
+    return raw;
+  }
+
+  /// `/api/proxy` 需要登录态，`Image.network` 不会自动带 dio 的 cookie，
+  /// 所以走代理的图要把 cookie 头显式传进去。
+  Map<String, String> get imageHeaders =>
+      _cookie.isEmpty ? const <String, String>{} : <String, String>{'Cookie': _cookie};
+
   /// 统一异常转换：网络层错误 → 中文提示
-  Future<Response<String>> _request(
-    Future<Response<String>> Function() run,
-  ) async {
+  Future<Response<T>> _request<T>(Future<Response<T>> Function() run) async {
     try {
       return await run();
     } on DioException catch (e) {

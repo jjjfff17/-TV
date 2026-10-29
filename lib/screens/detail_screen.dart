@@ -105,8 +105,12 @@ class _DetailScreenState extends State<DetailScreen> {
           Container(color: const Color(0xFF0B0F16)),
           if (cover != null && cover.isNotEmpty)
             Image.network(
-              cover,
+              // 豆瓣封面需代理（防盗链 418/403），代理还要带登录 cookie
+              Api.i.imageUrl(cover),
               fit: BoxFit.cover,
+              headers: Api.i.imageUrl(cover).contains('/api/proxy')
+                  ? Api.i.imageHeaders
+                  : null,
               errorBuilder: (_, __, ___) => const SizedBox.shrink(),
             ),
           // 压暗，保证白色文字和图标在亮封面上也读得清

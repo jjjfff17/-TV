@@ -34,6 +34,9 @@ class _HomeScreenState extends State<HomeScreen> {
   List<SearchItem>? _results;
   bool _searching = false;
   String? _searchError;
+  int _srcDone = 0;
+  int _srcTotal = 0;
+  final Set<String> _seen = <String>{};
 
   @override
   void initState() {
@@ -69,22 +72,45 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _beginSearch() {
+    _seen.clear();
+    setState(() {
+      _searching = true;
+      _searchError = null;
+      _results = <SearchItem>[];
+      _srcDone = 0;
+      _srcTotal = Api.i.sources.isEmpty ? 16 : Api.i.sources.length;
+    });
+  }
+
+  /// 并入一批流式结果：按「源+vodId」去重，done 事件里的全量列表也不会重复
+  void _appendEvent(SearchEvent e) {
+    final List<SearchItem> buf = _results ?? <SearchItem>[];
+    for (final SearchItem it in e.items) {
+      if (_seen.add('${it.sourceKey}|${it.vodId}')) buf.add(it);
+    }
+    _results = buf;
+    if (e.done) {
+      _searching = false;
+      _srcDone = _srcTotal;
+    } else {
+      _srcDone = (_srcDone + 1).clamp(0, _srcTotal);
+    }
+  }
+
   Future<void> _runSearch(String wd) async {
     final String key = wd.trim();
     if (key.isEmpty) return;
     FocusScope.of(context).unfocus();
-    setState(() {
-      _searching = true;
-      _searchError = null;
-      _results = null;
-    });
+    _beginSearch();
     try {
-      final List<SearchItem> list = await Api.i.search(key);
+      // 流式：每完成一个源就刷新一次，首个结果约 2 秒出现（不再等满 16 个源）
+      await for (final SearchEvent e in Api.i.searchStream(key)) {
+        if (!mounted) return;
+        setState(() => _appendEvent(e));
+      }
       if (!mounted) return;
-      setState(() {
-        _results = list;
-        _searching = false;
-      });
+      setState(() => _searching = false);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -94,23 +120,34 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// 榜单条目没有片源 ID，用它做关键词搜一次再进详情
+  /// 榜单条目没有片源 ID，用它做关键词搜一次再进详情。
+  /// 拿到第一批结果就进详情，不等 16 个源跑完。
   Future<void> _openByTitle(String title) async {
     _q.text = title;
-    setState(() {
-      _searching = true;
-      _searchError = null;
-      _results = null;
-    });
+    _beginSearch();
     try {
-      final List<SearchItem> list = await Api.i.search(title);
+      SearchItem? first;
+      await for (final SearchEvent e in Api.i.searchStream(title)) {
+        if (!mounted) return;
+        setState(() => _appendEvent(e));
+        if (e.items.isNotEmpty) {
+          first = e.items.first;
+          break;
+        }
+      }
       if (!mounted) return;
-      setState(() => _searching = false);
-      if (list.isEmpty) {
-        setState(() => _searchError = '没有找到「$title」的片源，试试搜索别的关键词');
+      if (first == null) {
+        setState(() {
+          _searching = false;
+          _searchError = '没有找到「$title」的片源，试试搜索别的关键词';
+        });
         return;
       }
-      _openDetail(list.first);
+      setState(() {
+        _searching = false;
+        _results = null;
+      });
+      _openDetail(first);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -165,7 +202,9 @@ class _HomeScreenState extends State<HomeScreen> {
           children: <Widget>[
             _header(),
             _searchBar(),
-            if (_results == null) ...<Widget>[
+            if (_searching && (_results == null || _results!.isEmpty))
+              Expanded(child: _searchingView())
+            else if (_results == null) ...<Widget>[
               _tabBar(),
               Expanded(child: _hotGrid()),
             ] else
@@ -382,31 +421,69 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// 首次搜索时的整页反馈：给出进度，避免"点了没反应"
+  Widget _searchingView() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          const SizedBox(
+            width: 22,
+            height: 22,
+            child: CircularProgressIndicator(strokeWidth: 2, color: C.accent),
+          ),
+          const SizedBox(height: 14),
+          const Text(
+            '正在搜索各个片源…',
+            style: TextStyle(color: C.text, fontSize: 13),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            _srcTotal > 0 ? '已完成 $_srcDone / $_srcTotal 个源' : '连接中…',
+            style: const TextStyle(color: C.muted, fontSize: 11.5),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _resultList() {
-    if (_searching) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            CircularProgressIndicator(strokeWidth: 2, color: C.accent),
-            SizedBox(height: 12),
-            Text('正在聚合搜索各个片源…', style: TextStyle(color: C.muted, fontSize: 12)),
-          ],
-        ),
-      );
-    }
     if (_searchError != null) {
       return _hint(_searchError!, retry: () => _runSearch(_q.text));
     }
     final List<SearchItem> list = _results ?? <SearchItem>[];
-    if (list.isEmpty) {
+    if (list.isEmpty && !_searching) {
       return _hint('没有找到相关片源，换个关键词试试');
     }
     return ListView.separated(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
-      itemCount: list.length,
+      // 末尾多一行：搜索中时显示进度
+      itemCount: list.length + (_searching ? 1 : 0),
       separatorBuilder: (_, __) => const SizedBox(height: 10),
       itemBuilder: (BuildContext _, int i) {
+        if (i >= list.length) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                const SizedBox(
+                  width: 13,
+                  height: 13,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.6,
+                    color: C.muted,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '继续搜索中 $_srcDone / $_srcTotal',
+                  style: const TextStyle(color: C.muted, fontSize: 11.5),
+                ),
+              ],
+            ),
+          );
+        }
         final SearchItem it = list[i];
         return GestureDetector(
           onTap: () => _openDetail(it),
@@ -480,9 +557,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _poster(String? url) {
     if (url == null || url.isEmpty) return _posterFallback();
+    // 豆瓣图有防盗链（418/403），走自家代理；采集站图直连
+    final String u = Api.i.imageUrl(url);
+    final bool proxied = u.contains('/api/proxy');
     return Image.network(
-      url,
+      u,
       fit: BoxFit.cover,
+      headers: proxied ? Api.i.imageHeaders : null,
       errorBuilder: (_, __, ___) => _posterFallback(),
       loadingBuilder: (BuildContext _, Widget child, ImageChunkEvent? p) {
         if (p == null) return child;

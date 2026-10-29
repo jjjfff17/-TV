@@ -45,7 +45,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   final List<StreamSubscription<dynamic>> _subs = <StreamSubscription<dynamic>>[];
 
-  bool _landscape = false;
+  bool _landscape = true;
   String? _error;
   double _speed = 1.0;
 
@@ -113,6 +113,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     unawaited(WakelockPlus.enable());
     unawaited(_initBrightness());
     _restartHideTimer();
+    // 进入播放页即横屏全屏：等首帧后再转，避免个别机型转屏失败
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_enterFullscreen());
+    });
   }
 
   bool get _hasEpisodes => widget.episodes.length > 1;
@@ -158,7 +162,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     unawaited(WakelockPlus.disable());
     unawaited(_player.dispose());
     unawaited(
-      SystemChrome.setPreferredOrientations(const <DeviceOrientation>[]),
+      SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+        DeviceOrientation.portraitUp,
+      ]),
     );
     unawaited(
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
@@ -259,24 +265,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _showHud(_locked ? '已锁定' : '已解锁');
   }
 
+  /// 进入横屏全屏（进播放页就调它，符合"点开即全屏横屏"的手感）
+  Future<void> _enterFullscreen() async {
+    await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (!mounted) return;
+    setState(() => _landscape = true);
+    _restartHideTimer();
+  }
+
+  /// 退出全屏：回到竖屏 + 恢复系统栏
+  Future<void> _exitFullscreen() async {
+    await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+      DeviceOrientation.portraitUp,
+    ]);
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (!mounted) return;
+    setState(() => _landscape = false);
+    _restartHideTimer();
+  }
+
   Future<void> _toggleFullscreen() async {
     if (_landscape) {
-      await SystemChrome.setPreferredOrientations(
-        const <DeviceOrientation>[DeviceOrientation.portraitUp],
-      );
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      await _exitFullscreen();
     } else {
-      await SystemChrome.setPreferredOrientations(
-        const <DeviceOrientation>[
-          DeviceOrientation.landscapeLeft,
-          DeviceOrientation.landscapeRight,
-        ],
-      );
-      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      await _enterFullscreen();
     }
-    if (!mounted) return;
-    setState(() => _landscape = !_landscape);
-    _restartHideTimer();
   }
 
   // ---------- 手势 ----------
@@ -737,6 +754,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
             Expanded(child: _danmakuPill()),
             _textBtn('${_speed}x', onTap: _showSpeedSheet),
             _textBtn('选集', onTap: _showEpisodeSheet),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => unawaited(_exitFullscreen()),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                child: Icon(
+                  Icons.fullscreen_exit_rounded,
+                  size: 22,
+                  color: Colors.white,
+                ),
+              ),
+            ),
           ],
         ),
       ],

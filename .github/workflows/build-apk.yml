@@ -1,0 +1,45 @@
+name: Build LibreTV Native APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Scaffold Android project
+        run: |
+          flutter create --platforms=android --org com.libretv --project-name native /tmp/app
+          rm -rf /tmp/app/lib
+          cp -r lib /tmp/app/lib
+          cp pubspec.yaml /tmp/app/pubspec.yaml
+          python3 tool/patch_manifest.py /tmp/app/android/app/src/main/AndroidManifest.xml
+
+      - name: Build release APK
+        run: |
+          cd /tmp/app
+          flutter pub get
+          flutter build apk --release --split-per-abi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: libretv-native-apk
+          path: /tmp/app/build/app/outputs/flutter-apk/*.apk

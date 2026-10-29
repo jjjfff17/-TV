@@ -26,7 +26,7 @@ jobs:
 
       - name: Scaffold Android project
         run: |
-          flutter create --platforms=android --org com.libretv --project-name native /tmp/app
+          flutter create --platforms=android --org com.libretv --project-name app /tmp/app
           rm -rf /tmp/app/lib
           cp -r lib /tmp/app/lib
           cp pubspec.yaml /tmp/app/pubspec.yaml

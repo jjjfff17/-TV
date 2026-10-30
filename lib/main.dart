@@ -28,7 +28,9 @@ class LibreTvApp extends StatelessWidget {
         scaffoldBackgroundColor: C.bg,
         colorScheme: ColorScheme.fromSeed(seedColor: C.accent),
         // 页面切换统一走 iOS 式横向滑动，比默认 Android 缩放更顺、更"贵"
-        pageTransitionsTheme: const PageTransitionsTheme(
+        // 注意：新版 Flutter 的 CupertinoPageTransitionsBuilder() 已非 const，
+        // 故此处不能加 const，否则报 "Not a constant expression"
+        pageTransitionsTheme: PageTransitionsTheme(
           builders: <TargetPlatform, PageTransitionsBuilder>{
             TargetPlatform.android: CupertinoPageTransitionsBuilder(),
             TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),

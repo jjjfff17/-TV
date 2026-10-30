@@ -4,7 +4,7 @@ import 'package:media_kit/media_kit.dart';
 
 import 'api.dart';
 import 'asset_paths.dart';
-import 'screens/home_screen.dart';
+import 'screens/main_shell.dart';
 import 'screens/login_screen.dart';
 import 'theme.dart';
 
@@ -121,7 +121,7 @@ class _BootGateState extends State<_BootGate> {
           onSuccess: () => setState(() => _phase = _Phase.home),
         );
       case _Phase.home:
-        return HomeScreen(
+        return MainShell(
           onLogout: () => setState(() => _phase = _Phase.login),
         );
       case _Phase.error:

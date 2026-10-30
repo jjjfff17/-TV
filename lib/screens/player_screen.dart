@@ -10,6 +10,8 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../api.dart';
 import '../asset_paths.dart';
+import '../history_store.dart';
+import '../models.dart';
 import '../mpv_tuning.dart';
 
 /// lanerc 风格播放页（全屏）
@@ -27,6 +29,17 @@ class PlayerScreen extends StatefulWidget {
     this.player,
     this.controller,
     this.onEpisodeChanged,
+
+    /// 从详情页点全屏进入：横屏上下文自建 Player+VideoController（绕开共享 Surface 黑屏）。
+    /// 此时不传 player/controller，PlayerScreen 自己开流，退出时回传 index/进度给详情页续播。
+    this.startFullscreen = false,
+
+    /// 用于写入「观看记录」的条目信息（来源/片名/封面）。不传则不记录历史。
+    this.item,
+
+    /// 退出全屏（任何方式：返回键/返回按钮/退出按钮）时回调，回传当前集与进度，
+    /// 详情页据此续播。用 dispose 回调而非拦截 pop，避免不同 Flutter 版本 API 差异。
+    this.onExit,
   });
 
   final String url;
@@ -37,6 +50,15 @@ class PlayerScreen extends StatefulWidget {
   final Player? player;
   final VideoController? controller;
   final ValueChanged<int>? onEpisodeChanged;
+
+  /// 从详情页点全屏进入：横屏上下文自建 Player+VideoController，退出回传 index/进度。
+  final bool startFullscreen;
+
+  /// 写入「观看记录」用的条目信息（来源/片名/封面）；为空则不记录。
+  final SearchItem? item;
+
+  /// 退出回调：回传当前集与进度（详情页续播用）。
+  final void Function(int index, Duration position, Duration duration)? onExit;
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -93,6 +115,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   final ValueNotifier<String> _hud = ValueNotifier<String>('');
   Timer? _hudTimer;
 
+  /// 观看记录：每 10s 写一次进度；退出时再补一次
+  Timer? _histTimer;
+
   static const List<double> _speeds = <double>[
     0.5,
     0.75,
@@ -106,6 +131,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    // 先发横屏/沉浸请求，再建 Player + VideoController，
+    // 尽量让 media_kit 的原生 Surface 一开始就按横屏尺寸创建（避免旋转后黑屏）。
+    if (widget.startFullscreen) {
+      unawaited(
+        SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+      );
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
+    }
     _index = widget.index;
     _url = widget.url;
     final bool own = widget.player == null;
@@ -175,7 +211,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     unawaited(WakelockPlus.enable());
     unawaited(_initBrightness());
     _restartHideTimer();
-    if (own) {
+    if (widget.startFullscreen) {
+      // 横屏请求已在 initState 最前面发出，这里只标记状态
+      _landscape = true;
+    } else if (own) {
       unawaited(_lockPortrait());
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(_lockPortrait());
@@ -192,6 +231,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
     }
     _armSlowTimer();
+    if (own && widget.item != null) _armHist();
   }
 
   Future<void> _lockPortrait() {
@@ -250,6 +290,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  // ---------- 观看记录 ----------
+
+  void _armHist() {
+    _histTimer?.cancel();
+    _histTimer = Timer.periodic(const Duration(seconds: 10), (_) => _recordHist());
+  }
+
+  void _recordHist() {
+    final SearchItem? it = widget.item;
+    if (it == null) return;
+    // 没真正开始播（位置为 0）不落记录，避免污染观看列表
+    if (_pos.inMilliseconds <= 0) return;
+    unawaited(HistoryStore.record(
+      sourceKey: it.sourceKey,
+      vodId: it.vodId,
+      name: it.name,
+      pic: it.pic,
+      sourceName: it.sourceName,
+      index: _index,
+      posMs: _pos.inMilliseconds,
+      durMs: _dur.inMilliseconds,
+    ));
+  }
+
+  /// 退出时回传给详情页：当前集 + 播放进度 + 总时长
   @override
   void dispose() {
     _pressTimer?.cancel();
@@ -257,6 +322,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _tapTimer?.cancel();
     _hudTimer?.cancel();
     _slowTimer?.cancel();
+    _histTimer?.cancel();
+    _recordHist();
+    // 任何方式退出（返回键/返回按钮/退出按钮）都会走到 dispose，
+    // 在这里回传当前集与进度，详情页据此续播。
+    widget.onExit?.call(_index, _pos, _dur);
     for (final StreamSubscription<dynamic> s in _subs) {
       unawaited(s.cancel());
     }
@@ -391,6 +461,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Future<void> _exitFullscreen() async {
+    // 从详情页进入的全屏：退出 = 回到详情页（dispose 回传进度）
+    if (widget.startFullscreen) {
+      if (mounted) Navigator.of(context).maybePop();
+      return;
+    }
     if (widget.player != null) {
       if (mounted) Navigator.of(context).maybePop();
       return;

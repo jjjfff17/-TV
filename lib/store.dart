@@ -54,6 +54,13 @@ class FavStore {
 
   static int get count => _map.length;
 
+  /// 全部收藏（按收藏时间倒序），供「我的」页展示
+  static List<FavItem> get items {
+    final List<FavItem> list = _map.values.toList();
+    list.sort((FavItem a, FavItem b) => b.ts.compareTo(a.ts));
+    return list;
+  }
+
   /// 返回切换后的状态：true = 已收藏
   static Future<bool> toggle({
     required String sourceKey,

@@ -7,6 +7,7 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../api.dart';
+import '../history_store.dart';
 import '../models.dart';
 import '../mpv_tuning.dart';
 import '../store.dart';
@@ -59,6 +60,11 @@ class _DetailScreenState extends State<DetailScreen> {
 
   Timer? _hideTimer;
   Timer? _slowTimer;
+  Timer? _histTimer;
+
+  /// 全屏返回时暂存：当前集与进度（PlayerScreen 在 dispose 回传）
+  int _resumeIndex = 0;
+  Duration _resumePos = Duration.zero;
 
   @override
   void initState() {
@@ -76,6 +82,8 @@ class _DetailScreenState extends State<DetailScreen> {
   void dispose() {
     _hideTimer?.cancel();
     _slowTimer?.cancel();
+    _histTimer?.cancel();
+    _recordHist();
     for (final StreamSubscription<dynamic> s in _subs) {
       unawaited(s.cancel());
     }
@@ -213,6 +221,7 @@ class _DetailScreenState extends State<DetailScreen> {
         _loadedIndex = i;
       }
       unawaited(WakelockPlus.enable());
+      _armHist();
     } catch (e) {
       _pErr.value = '$e';
     }
@@ -238,17 +247,46 @@ class _DetailScreenState extends State<DetailScreen> {
     if (_controls) _armHide();
   }
 
-  /// 进全屏：把同一个 Player / VideoController 交给 PlayerScreen（瞬时切换、进度不丢）
+  // ---------- 观看记录 ----------
+
+  void _armHist() {
+    _histTimer?.cancel();
+    _histTimer = Timer.periodic(const Duration(seconds: 10), (_) => _recordHist());
+  }
+
+  void _recordHist() {
+    final VideoDetail? d = _detail;
+    final int? i = _ep;
+    if (d == null || i == null) return;
+    final int posMs = _pos.value.inMilliseconds;
+    if (posMs <= 0) return;
+    unawaited(HistoryStore.record(
+      sourceKey: widget.item.sourceKey,
+      vodId: widget.item.vodId,
+      name: widget.item.name,
+      pic: widget.item.pic,
+      sourceName: widget.item.sourceName,
+      index: i,
+      posMs: posMs,
+      durMs: _dur.value.inMilliseconds,
+    ));
+  }
+
+  /// 进全屏：详情页暂停并卸载自带 Video（释放纹理），
+  /// PlayerScreen 在横屏自建 Player+VideoController 开流（绕开共享 Surface 黑屏）。
+  /// 退出后按回传的集与进度续播。
   Future<void> _enterFullscreen() async {
     final VideoDetail? d = _detail;
     final int? i = _ep;
-    final Player? p = _player;
-    final VideoController? c = _controller;
-    if (d == null || i == null || p == null || c == null) return;
+    if (d == null || i == null) return;
     _hideTimer?.cancel();
+    await _player?.pause();
+    _recordHist();
+    _resumeIndex = i;
+    _resumePos = _pos.value;
     setState(() {
       _controls = true;
-      _fullscreen = true; // 本页 Video 卸载，独占纹理
+      _fullscreen = true; // 卸载本页 Video，释放纹理给全屏页
     });
     await Navigator.of(context).push(
       PageRouteBuilder<void>(
@@ -261,11 +299,15 @@ class _DetailScreenState extends State<DetailScreen> {
               episodes: d.episodes,
               index: i,
               sourceName: widget.item.sourceName,
-              player: p,
-              controller: c,
+              startFullscreen: true,
+              item: widget.item,
               onEpisodeChanged: (int ni) {
                 if (!mounted) return;
                 setState(() => _ep = ni);
+              },
+              onExit: (int idx, Duration pos, Duration dur) {
+                _resumeIndex = idx;
+                _resumePos = pos;
               },
             ),
         transitionsBuilder: (BuildContext _, Animation<double> a, Animation<double> __, Widget child) {
@@ -274,16 +316,38 @@ class _DetailScreenState extends State<DetailScreen> {
       ),
     );
     if (!mounted) return;
-    _loadedIndex = _ep ?? _loadedIndex;
     setState(() {
       _fullscreen = false;
       _controls = true;
     });
+    await _resumeFromFullscreen();
+    _armHide();
+  }
+
+  /// 从全屏回来：按回传的集与进度续播（必要时重新装载该集）
+  Future<void> _resumeFromFullscreen() async {
+    final VideoDetail? d = _detail;
+    final Player? p = _player;
+    if (d == null || p == null || d.episodes.isEmpty) return;
+    final int idx = _resumeIndex.clamp(0, d.episodes.length - 1).toInt();
+    final Duration pos = _resumePos;
+    setState(() => _ep = idx);
+    _pErr.value = null;
+    try {
+      unawaited(WakelockPlus.enable());
+      if (idx != _loadedIndex) {
+        await p.open(Media(d.episodes[idx]));
+        _loadedIndex = idx;
+      }
+      if (pos > Duration.zero) await p.seek(pos);
+      await p.play();
+    } catch (e) {
+      _pErr.value = '$e';
+    }
     _started.value = true; // 从全屏回来通常在播，别再弹加载浮层
-    _pos.value = p.state.position;
+    _pos.value = pos;
     _playing.value = p.state.playing;
     _dur.value = p.state.duration;
-    _armHide();
   }
 
   Future<void> _toggleFav() async {

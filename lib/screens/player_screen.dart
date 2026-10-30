@@ -12,7 +12,7 @@ import '../api.dart';
 import '../asset_paths.dart';
 import '../mpv_tuning.dart';
 
-/// lanerc 风格播放页（M2 皮肤 + 手势）
+/// lanerc 风格播放页（全屏）
 /// 手势：轻横滑 ±4s / 长横滑 ±15s；竖滑音量亮度；双击播放暂停；长按 2x，上滑 3x，下滑 1.5x。
 enum _Mode { idle, pending, speed, seek, vertical }
 
@@ -31,21 +31,11 @@ class PlayerScreen extends StatefulWidget {
 
   final String url;
   final String title;
-
-  /// 同一部片子的全部剧集地址（为空时上一集/下一集不可用）
   final List<String> episodes;
-
-  /// 当前是第几集（0 起）
   final int index;
-
   final String? sourceName;
-
-  /// 详情页内嵌播放器进全屏时复用同一个 Player / VideoController。
-  /// 传入后本页不再创建、也不再销毁播放器 —— 退出全屏不会打断播放，进度也不丢。
   final Player? player;
   final VideoController? controller;
-
-  /// 全屏里换集后回传，让详情页的选集高亮跟着变
   final ValueChanged<int>? onEpisodeChanged;
 
   @override
@@ -62,21 +52,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String? _error;
   double _speed = 1.0;
 
-  /// 是否已经真正出画（出过画面就不再显示加载浮层）
   bool _started = false;
-  /// 起播超过 10 秒还没出画
   bool _slow = false;
-  /// libmpv 正在缓冲（网络抖动或拖动后重新取流）
   bool _buffering = false;
   Timer? _slowTimer;
-  /// 进度条/时间文本专用：拖动时是目标位置，否则是真实位置。
-  /// 用它做局部重建，替代"整树 setState"——那才是进度条看起来不跟手的根因（节流期间不刷新）。
+
+  /// 画面比例：0 = 铺满(cover)，1 = 原始(contain)，2 = 16:9
+  int _fitMode = 0;
+
   final ValueNotifier<Duration> _uiPos = ValueNotifier<Duration>(Duration.zero);
-  /// 是否正在手动拖动底部进度条（拖动中只更新显示，松手才真正 seek）
   bool _seekingSlider = false;
-  /// 是否已切到 /api/proxy 代理线路（只切一次，避免死循环）
   bool _viaProxy = false;
-  /// 拖动时进度条重绘节流
   int _lastSeekUiAt = 0;
 
   late int _index;
@@ -133,13 +119,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       );
     } else {
-      // 复用详情页的播放器：不新建原生实例
       _controller = widget.controller!;
     }
 
     _subs.add(_player.stream.error.listen((String e) {
       if (!mounted) return;
-      // 直连源站失败时自动走同源代理（和 Web 端 hls.js 的策略一致），只重试一次
       if (!_viaProxy) {
         _viaProxy = true;
         setState(() {
@@ -158,9 +142,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _subs.add(_player.stream.position.listen((Duration v) {
       _pos = v;
       if (!_seekingSlider && _mode != _Mode.seek) _uiPos.value = v;
-      // 真正的"出画"判据是时间轴开始前进。
-      // libmpv 的 playing 事件在首帧之前就为 true，用它判断会让加载浮层刚显示就被收掉，
-      // 用户看到的就是"一直黑屏、没有任何加载提示"。
       if (!_started && v > const Duration(milliseconds: 250)) {
         _started = true;
         _slow = false;
@@ -185,8 +166,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (own) {
       unawaited(_openCurrent());
     } else {
-      // 复用外部播放器：不重新拉流，只把当前状态同步进来，
-      // 否则进全屏会黑一下再从头缓冲，肉眼就是"点了全屏卡两秒"。
       _pos = _player.state.position;
       _dur = _player.state.duration;
       _playing = _player.state.playing;
@@ -197,17 +176,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     unawaited(_initBrightness());
     _restartHideTimer();
     if (own) {
-      // 独立进入播放页：默认竖屏，点全屏键才转横屏。
-      // 关键：首帧后再补锁一次 —— Android 12+ 在 initState 阶段 Activity 可能还没 attach，
-      // 只调一次会被系统静默丢弃，表现就是"点播放自己变横屏"。
       unawaited(_lockPortrait());
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(_lockPortrait());
       });
       unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     } else {
-      // 从详情页内嵌播放器点全屏键进来：进来就该是横屏全屏，
-      // 不能让用户再点第二次全屏键。
       _landscape = true;
       unawaited(
         SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
@@ -215,22 +189,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
           DeviceOrientation.landscapeRight,
         ]),
       );
-      unawaited(
-        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
-      );
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
     }
-    // 起播慢时给个"不是卡死"的交代（10 秒还没出画面就提示换源）
     _armSlowTimer();
   }
 
-  /// 锁竖屏（可被 initState / 首帧后 / 退出全屏复用）
   Future<void> _lockPortrait() {
     return SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
       DeviceOrientation.portraitUp,
     ]);
   }
 
-  /// 起播看门狗：到点还没出画就提示"加载较慢"
   void _armSlowTimer({int seconds = 10}) {
     _slowTimer?.cancel();
     _slowTimer = Timer(Duration(seconds: seconds), () {
@@ -238,9 +207,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
   }
 
-  /// libmpv 调优已抽到 ../mpv_tuning.dart，与详情页内嵌播放器共用同一份参数。
-
-  /// 打开当前剧集：直连失败过一次就改用代理地址
   Future<void> _openCurrent() async {
     if (!mounted) return;
     final String target = _viaProxy ? Api.i.proxyUrl(_url) : _url;
@@ -269,7 +235,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
     _uiPos.value = Duration.zero;
     _armSlowTimer();
-    // 通知详情页同步选集高亮（全屏换集后返回，页面不能还停在旧集上）
     widget.onEpisodeChanged?.call(i);
     await _player.setRate(_speed);
     await _openCurrent();
@@ -297,8 +262,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     _hud.dispose();
     _uiPos.dispose();
-    // 只有自己创建的播放器才由本页销毁；
-    // 详情页传进来的播放器退出全屏后还要继续在页面里播，不能在这里 dispose。
     if (widget.player == null) {
       unawaited(WakelockPlus.disable());
       unawaited(_player.dispose());
@@ -308,9 +271,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         DeviceOrientation.portraitUp,
       ]),
     );
-    unawaited(
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge),
-    );
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     super.dispose();
   }
 
@@ -407,7 +368,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _showHud(_locked ? '已锁定' : '已解锁');
   }
 
-  /// 进入横屏全屏（只由全屏键/横屏控件调用，进播放页不再自动转屏）
+  /// 画面比例切换：铺满 → 原始 → 16:9
+  void _cycleFit() {
+    setState(() => _fitMode = (_fitMode + 1) % 3);
+    _showHud(_fitMode == 0
+        ? '画面：铺满'
+        : _fitMode == 1
+            ? '画面：原始比例'
+            : '画面：16:9');
+    _restartHideTimer();
+  }
+
   Future<void> _enterFullscreen() async {
     await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
       DeviceOrientation.landscapeLeft,
@@ -419,8 +390,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _restartHideTimer();
   }
 
-  /// 退出全屏：从详情页进来的，退出全屏就是关掉本页（回到内嵌播放器）；
-  /// 独立进入的，回到竖屏继续在本页看。
   Future<void> _exitFullscreen() async {
     if (widget.player != null) {
       if (mounted) Navigator.of(context).maybePop();
@@ -510,7 +479,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
         final String sign = secs >= 0 ? '+' : '';
         _showHud('$sign${secs.round()}s · ${_fmt(_seekTarget)}', ms: 600);
       }
-      // 进度条跟手：只更新进度条自己的 notifier，不重建整棵树
       if (now - _lastSeekUiAt > 40) {
         _lastSeekUiAt = now;
         _uiPos.value = _seekTarget;
@@ -548,7 +516,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       unawaited(_player.setRate(_baseRate));
       _showHud('已恢复');
     } else if (_mode == _Mode.seek) {
-      // 先把显示对齐到目标位置再发 seek：否则松手瞬间进度条会先"回跳"到旧位置再跳回来
       _pos = _seekTarget;
       _uiPos.value = _seekTarget;
       unawaited(_player.seek(_seekTarget));
@@ -556,7 +523,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _handleTap();
     }
     _mode = _Mode.idle;
-    // 拖动结束后让进度条回到真实播放位置
     if (mounted) setState(() {});
     if (_controlsVisible && !_locked) _restartHideTimer();
   }
@@ -674,12 +640,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                                 alignment: Alignment.center,
                                 decoration: BoxDecoration(
                                   color: i == _index
-                                      ? const Color(0xFF2F6BFF)
+                                      ? const Color(0xFF13BFD2)
                                       : const Color(0x14FFFFFF),
                                   borderRadius: BorderRadius.circular(12),
                                   border: Border.all(
                                     color: i == _index
-                                        ? const Color(0xFF2F6BFF)
+                                        ? const Color(0xFF13BFD2)
                                         : const Color(0x1FFFFFFF),
                                   ),
                                 ),
@@ -710,21 +676,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   // ---------- 构建 ----------
 
+  /// 全屏画面：铺满(cover) / 原始(contain) / 16:9
+  Widget _videoLayer() {
+    final Widget v = Video(
+      controller: _controller,
+      controls: NoVideoControls,
+      fit: _fitMode == 1 ? BoxFit.contain : BoxFit.cover,
+    );
+    if (_fitMode == 2) {
+      return Center(
+        child: AspectRatio(
+          aspectRatio: 16 / 9,
+          child: Video(
+            controller: _controller,
+            controls: NoVideoControls,
+            fit: BoxFit.contain,
+          ),
+        ),
+      );
+    }
+    // cover 时超出屏幕的部分裁掉，避免画到屏幕外
+    return ClipRect(child: SizedBox.expand(child: v));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: <Widget>[
-          Center(
-            child: AspectRatio(
-              aspectRatio: 16 / 9,
-              child: Video(
-                controller: _controller,
-                controls: NoVideoControls,
-              ),
-            ),
-          ),
+          Positioned.fill(child: _videoLayer()),
           Positioned.fill(
             child: Listener(
               behavior: HitTestBehavior.opaque,
@@ -746,8 +727,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  /// 起播/缓冲浮层：黑屏期间明确告知"在加载"，避免误判资源失效。
-  /// 做成整屏压暗 + 居中大字：之前只有一个小半透明方块，叠在黑色视频上几乎看不见。
   Widget _buildLoading() {
     final bool show = !_started || _buffering;
     if (!show || _error != null) return const SizedBox.shrink();
@@ -834,8 +813,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ),
                   ),
                 ),
-                _iconBtn('floating', 22, () => _showHud('悬浮窗将在后续版本接入')),
-                _iconBtn('airplay', 22, () => _showHud('投屏将在后续版本接入')),
                 _iconBtn('more', 22, _showEpisodeSheet),
               ],
             ),
@@ -880,11 +857,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  /// 进度条（横竖屏共用）
-  ///
-  /// 之前的坑：Slider 是"受控组件"，value 绑的是 200ms 节流后的播放位置，而 onChanged
-  /// 每一帧都在发 seek —— 手指滑到哪、滑块被拉回旧位置，越拖越乱，还让 libmpv 反复重建缓冲。
-  /// 现在：拖动期间只更新本地显示（_uiPos + _seekingSlider），松手才发一次 seek。
   Widget _progressBlock({required bool withFullscreen}) {
     return ValueListenableBuilder<Duration>(
       valueListenable: _uiPos,
@@ -936,7 +908,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
               _fmt(_dur),
               style: const TextStyle(color: Colors.white70, fontSize: 12),
             ),
-            if (withFullscreen) _iconBtn('full', 22, _toggleFullscreen),
+            if (withFullscreen) ...<Widget>[
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _cycleFit,
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                  child: Icon(Icons.aspect_ratio_rounded, size: 20, color: Colors.white),
+                ),
+              ),
+              _iconBtn('full', 22, _toggleFullscreen),
+            ],
           ],
         );
       },
@@ -979,6 +961,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
             const SizedBox(width: 8),
             const Spacer(),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _cycleFit,
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                child: Icon(Icons.aspect_ratio_rounded, size: 22, color: Colors.white),
+              ),
+            ),
             _textBtn('${_speed}x', onTap: _showSpeedSheet),
             _textBtn('选集', onTap: _showEpisodeSheet),
             GestureDetector(

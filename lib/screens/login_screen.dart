@@ -130,7 +130,7 @@ class _LoginScreenState extends State<LoginScreen> {
           gradient: RadialGradient(
             center: Alignment(0, -0.55),
             radius: 1.1,
-            colors: <Color>[Color(0xFF1B2436), C.darkBg],
+            colors: <Color>[Color(0xFF0E2A2E), C.darkBg],
           ),
         ),
         child: SafeArea(

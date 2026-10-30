@@ -4,20 +4,22 @@ import 'package:media_kit/media_kit.dart';
 
 /// libmpv 调优（详情页内嵌播放器与全屏播放页共用一份，避免两边参数漂移）。
 ///
-/// 为什么需要：libmpv 默认缓冲很小，起播和每次 seek 都要重新连源站 + 重新 probe，
-/// 而 Web 端走 hls.js + MSE（buffered 120 秒），所以同一个片源 App 明显更慢。
-///
-/// 为什么用 dynamic：media_kit 各版本对 NativePlayer 的导出不完全一致，
-/// 写死类型会在 CI 上编译失败；这里即便取不到原生对象，也只是少了优化，不影响播放。
+/// 0.5.0 改动的核心：**起播要快**。
+/// 0.4.x 把 `cache-secs` 开到 60、readahead 30 秒 —— 等于让播放器等"囤够一分钟"再开演，
+/// 表现就是"点了播放，转圈好几秒"。网页端 hls.js 拿到第一个分片就出画，所以显得秒开。
+/// 这里改成低延迟档：最多囤 6 秒、预读 4 秒，并且起播时不等缓冲填满。
+/// 再配合详情页"预载不播"（点播放键直接 play），基本能做到点开即播。
 void applyMpvTuning(Player player) {
   const Map<String, String> props = <String, String>{
     'cache': 'yes',
-    'cache-secs': '60',
-    'demuxer-max-bytes': '67108864', // 64 MiB
-    'demuxer-max-back-bytes': '33554432', // 32 MiB
-    'demuxer-readahead-secs': '30',
-    'hwdec': 'auto-safe',
-    'network-timeout': '15',
+    'cache-secs': '6', // 最多向前缓存 6 秒（原 60，起播慢的主因）
+    'demuxer-readahead-secs': '4', // 预读 4 秒（原 30）
+    'demuxer-max-bytes': '33554432', // 32 MiB
+    'demuxer-max-back-bytes': '16777216', // 16 MiB
+    'cache-pause-initial': 'no', // 起播时不要在缓冲里干等
+    'cache-pause-wait': '1',
+    'hwdec': 'auto-safe', // 硬件解码，省电且顺
+    'network-timeout': '10',
     'force-seekable': 'yes',
   };
   unawaited(() async {

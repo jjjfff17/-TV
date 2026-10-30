@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../api.dart';
 import '../models.dart';
 import '../theme.dart';
+import '../ui.dart';
 import 'detail_screen.dart';
 
 /// 首页：榜单浏览 + 搜索。点海报 → 按标题搜索 → 打开详情。
@@ -104,7 +106,6 @@ class _HomeScreenState extends State<HomeScreen> {
     FocusScope.of(context).unfocus();
     _beginSearch();
     try {
-      // 流式：每完成一个源就刷新一次，首个结果约 2 秒出现（不再等满 16 个源）
       await for (final SearchEvent e in Api.i.searchStream(key)) {
         if (!mounted) return;
         setState(() => _appendEvent(e));
@@ -113,6 +114,20 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _searching = false);
     } catch (e) {
       if (!mounted) return;
+      if ((_results ?? <SearchItem>[]).isEmpty) {
+        try {
+          final List<SearchItem> list = await Api.i.search(key);
+          if (!mounted) return;
+          setState(() {
+            _results = list;
+            _searching = false;
+            _srcDone = _srcTotal;
+          });
+          return;
+        } catch (_) {
+          // 兜底也失败，落到下面的错误提示
+        }
+      }
       setState(() {
         _searchError = e is ApiException ? e.message : '$e';
         _searching = false;
@@ -121,7 +136,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// 榜单条目没有片源 ID，用它做关键词搜一次再进详情。
-  /// 拿到第一批结果就进详情，不等 16 个源跑完。
   Future<void> _openByTitle(String title) async {
     _q.text = title;
     _beginSearch();
@@ -158,9 +172,35 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _openDetail(SearchItem item) {
+    HapticFeedback.selectionClick();
     Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (BuildContext _) => DetailScreen(item: item),
+      PageRouteBuilder<void>(
+        transitionDuration: const Duration(milliseconds: 260),
+        reverseTransitionDuration: const Duration(milliseconds: 220),
+        pageBuilder: (BuildContext _, Animation<double> __, Animation<double> ___) =>
+            DetailScreen(item: item),
+        transitionsBuilder: (
+          BuildContext _,
+          Animation<double> a,
+          Animation<double> __,
+          Widget child,
+        ) {
+          final Animation<double> ease = CurvedAnimation(
+            parent: a,
+            curve: Curves.easeOutCubic,
+            reverseCurve: Curves.easeInCubic,
+          );
+          return FadeTransition(
+            opacity: ease,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.03),
+                end: Offset.zero,
+              ).animate(ease),
+              child: child,
+            ),
+          );
+        },
       ),
     );
   }
@@ -234,12 +274,12 @@ class _HomeScreenState extends State<HomeScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
               decoration: BoxDecoration(
-                color: C.soft,
+                color: C.accentSoft,
                 borderRadius: BorderRadius.circular(Metrics.tag),
               ),
               child: Text(
                 'v${Api.i.version}',
-                style: const TextStyle(color: C.muted, fontSize: 10),
+                style: const TextStyle(color: C.accentDeep, fontSize: 10),
               ),
             ),
           const Spacer(),
@@ -258,11 +298,11 @@ class _HomeScreenState extends State<HomeScreen> {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
       child: Container(
-        height: 40,
+        height: 42,
         padding: const EdgeInsets.only(left: 14, right: 6),
         decoration: BoxDecoration(
           color: C.soft,
-          borderRadius: BorderRadius.circular(20),
+          borderRadius: BorderRadius.circular(21),
         ),
         child: Row(
           children: <Widget>[
@@ -279,7 +319,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   hintStyle: TextStyle(color: C.muted, fontSize: 13),
                   border: InputBorder.none,
                   isDense: true,
-                  contentPadding: EdgeInsets.symmetric(vertical: 10),
+                  contentPadding: EdgeInsets.symmetric(vertical: 11),
                 ),
               ),
             ),
@@ -298,7 +338,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 onPressed: () => _runSearch(_q.text),
                 child: const Text(
                   '搜索',
-                  style: TextStyle(color: C.accent, fontSize: 13),
+                  style: TextStyle(color: C.accentDeep, fontSize: 13),
                 ),
               ),
           ],
@@ -318,7 +358,10 @@ class _HomeScreenState extends State<HomeScreen> {
         itemBuilder: (BuildContext _, int i) {
           final bool on = _tabs[i][0] == _tab;
           return GestureDetector(
-            onTap: () => _loadHot(_tabs[i][0]),
+            onTap: () {
+              HapticFeedback.selectionClick();
+              _loadHot(_tabs[i][0]);
+            },
             child: Container(
               alignment: Alignment.center,
               padding: const EdgeInsets.symmetric(horizontal: 14),
@@ -333,7 +376,7 @@ class _HomeScreenState extends State<HomeScreen> {
               child: Text(
                 _tabs[i][1],
                 style: TextStyle(
-                  color: on ? C.accent : C.sub,
+                  color: on ? C.accentDeep : C.sub,
                   fontSize: 13,
                   fontWeight: on ? FontWeight.w600 : FontWeight.w400,
                 ),
@@ -347,8 +390,25 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _hotGrid() {
     if (_loadingHot) {
-      return const Center(
-        child: CircularProgressIndicator(strokeWidth: 2, color: C.accent),
+      return GridView.builder(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3,
+          mainAxisSpacing: 14,
+          crossAxisSpacing: 10,
+          childAspectRatio: 0.52,
+        ),
+        itemCount: 9,
+        itemBuilder: (BuildContext _, int __) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: const <Widget>[
+              Expanded(child: Skeleton(radius: 12)),
+              SizedBox(height: 8),
+              Skeleton(width: 70, height: 11, radius: 4),
+            ],
+          );
+        },
       );
     }
     if (_hotError != null) {
@@ -376,7 +436,14 @@ class _HomeScreenState extends State<HomeScreen> {
               Expanded(
                 child: Stack(
                   children: <Widget>[
-                    Positioned.fill(child: _poster(it.cover)),
+                    Positioned.fill(
+                      child: RepaintBoundary(
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: NetImg(url: it.cover, memWidth: 340),
+                        ),
+                      ),
+                    ),
                     if (it.rating != null)
                       Positioned(
                         right: 5,
@@ -421,7 +488,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /// 首次搜索时的整页反馈：给出进度，避免"点了没反应"
   Widget _searchingView() {
     return Center(
       child: Column(
@@ -457,7 +523,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     return ListView.separated(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
-      // 末尾多一行：搜索中时显示进度
       itemCount: list.length + (_searching ? 1 : 0),
       separatorBuilder: (_, __) => const SizedBox(height: 10),
       itemBuilder: (BuildContext _, int i) {
@@ -493,12 +558,15 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(10),
-                  child: SizedBox(
-                    width: 62,
-                    height: 88,
-                    child: _poster(it.pic),
+                Hero(
+                  tag: 'p_${it.sourceKey}_${it.vodId}',
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(10),
+                    child: SizedBox(
+                      width: 62,
+                      height: 88,
+                      child: NetImg(url: it.pic, memWidth: 200),
+                    ),
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -536,7 +604,10 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                         child: Text(
                           it.sourceName,
-                          style: const TextStyle(color: C.accent, fontSize: 10),
+                          style: const TextStyle(
+                            color: C.accentDeep,
+                            fontSize: 10,
+                          ),
                         ),
                       ),
                     ],
@@ -552,31 +623,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
       },
-    );
-  }
-
-  Widget _poster(String? url) {
-    if (url == null || url.isEmpty) return _posterFallback();
-    // 豆瓣图有防盗链（418/403），走自家代理；采集站图直连
-    final String u = Api.i.imageUrl(url);
-    final bool proxied = u.contains('/api/proxy');
-    return Image.network(
-      u,
-      fit: BoxFit.cover,
-      headers: proxied ? Api.i.imageHeaders : null,
-      errorBuilder: (_, __, ___) => _posterFallback(),
-      loadingBuilder: (BuildContext _, Widget child, ImageChunkEvent? p) {
-        if (p == null) return child;
-        return Container(color: C.soft);
-      },
-    );
-  }
-
-  Widget _posterFallback() {
-    return Container(
-      color: C.soft,
-      alignment: Alignment.center,
-      child: const Icon(Icons.movie_outlined, size: 20, color: C.muted),
     );
   }
 
@@ -596,7 +642,7 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 14),
               TextButton(
                 onPressed: retry,
-                child: const Text('重试', style: TextStyle(color: C.accent)),
+                child: const Text('重试', style: TextStyle(color: C.accentDeep)),
               ),
             ],
           ],

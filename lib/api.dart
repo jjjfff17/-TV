@@ -273,7 +273,9 @@ class Api {
     if (body == null) return;
 
     yield* body.stream
-        .cast<List<int>>().transform(utf8.decoder)
+        // dio 给的是 Stream<Uint8List>，utf8.decoder 要 Stream<List<int>>，先 cast
+        .cast<List<int>>()
+        .transform(utf8.decoder)
         .transform(const LineSplitter())
         .where((String line) => line.trim().isNotEmpty)
         .map(_parseEvent)

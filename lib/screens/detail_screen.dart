@@ -272,22 +272,47 @@ class _DetailScreenState extends State<DetailScreen> {
     ));
   }
 
-  /// 进全屏：详情页暂停并卸载自带 Video（释放纹理），
-  /// PlayerScreen 在横屏自建 Player+VideoController 开流（绕开共享 Surface 黑屏）。
-  /// 退出后按回传的集与进度续播。
+  /// 彻底释放本页播放器：取消订阅 → 等 Video 摘树 → 销毁 libmpv 实例。
+  ///
+  /// 必须"先放后建"：一台设备上的硬件解码器与上游流连接都是稀缺资源，
+  /// 两个 Player 同时活着时，后建的那个会开不出流（全屏页永远 00:00）。
+  Future<void> _releasePlayer() async {
+    final Player? p = _player;
+    _player = null;
+    _controller = null;
+    _loadedIndex = -1;
+    _viaProxy = false;
+    for (final StreamSubscription<dynamic> s in _subs) {
+      unawaited(s.cancel());
+    }
+    _subs.clear();
+    // 等一帧，确保 Video widget 已从树上摘掉，再销毁原生播放器
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    if (p != null) {
+      try {
+        await p.dispose();
+      } catch (_) {}
+    }
+  }
+
+  /// 进全屏：详情页先把播放器彻底释放（唯一播放器原则），
+  /// PlayerScreen 在横屏新建 Player+VideoController 开流（绕开共享 Surface 黑屏），
+  /// 退出后按回传的集与进度重建续播。
   Future<void> _enterFullscreen() async {
     final VideoDetail? d = _detail;
     final int? i = _ep;
     if (d == null || i == null) return;
     _hideTimer?.cancel();
-    await _player?.pause();
+    _histTimer?.cancel();
     _recordHist();
     _resumeIndex = i;
     _resumePos = _pos.value;
     setState(() {
       _controls = true;
-      _fullscreen = true; // 卸载本页 Video，释放纹理给全屏页
+      _fullscreen = true; // 本页 Video 卸载，随后销毁纹理
     });
+    await _releasePlayer();
+    if (!mounted) return;
     await Navigator.of(context).push(
       PageRouteBuilder<void>(
         transitionDuration: const Duration(milliseconds: 240),
@@ -300,6 +325,7 @@ class _DetailScreenState extends State<DetailScreen> {
               index: i,
               sourceName: widget.item.sourceName,
               startFullscreen: true,
+              startAt: _resumePos,
               item: widget.item,
               onEpisodeChanged: (int ni) {
                 if (!mounted) return;
@@ -307,7 +333,7 @@ class _DetailScreenState extends State<DetailScreen> {
               },
               onExit: (int idx, Duration pos, Duration dur) {
                 _resumeIndex = idx;
-                _resumePos = pos;
+                if (pos > Duration.zero) _resumePos = pos;
               },
             ),
         transitionsBuilder: (BuildContext _, Animation<double> a, Animation<double> __, Widget child) {
@@ -324,30 +350,44 @@ class _DetailScreenState extends State<DetailScreen> {
     _armHide();
   }
 
-  /// 从全屏回来：按回传的集与进度续播（必要时重新装载该集）
+  /// 从全屏回来：重建本页播放器，按回传的集与进度续播
   Future<void> _resumeFromFullscreen() async {
     final VideoDetail? d = _detail;
-    final Player? p = _player;
-    if (d == null || p == null || d.episodes.isEmpty) return;
+    if (d == null || d.episodes.isEmpty) return;
+    // 全屏页的 Player 是在 dispose 里异步销毁的，先让原生侧收干净，
+    // 否则新实例又要和旧实例抢解码器（同 00:00 那个坑）。
+    await Future<void>.delayed(const Duration(milliseconds: 180));
+    if (!mounted) return;
     final int idx = _resumeIndex.clamp(0, d.episodes.length - 1).toInt();
     final Duration pos = _resumePos;
-    setState(() => _ep = idx);
     _pErr.value = null;
+    _slow.value = false;
+    _started.value = false;
+    _pos.value = Duration.zero;
+    _dur.value = Duration.zero;
+    _ensurePlayer();
+    if (!mounted) return;
+    setState(() {
+      _ep = idx;
+      _controls = true;
+    });
+    _armSlow();
+    final Player? p = _player;
+    if (p == null) return;
+    final bool resume = pos > const Duration(seconds: 1);
     try {
       unawaited(WakelockPlus.enable());
-      if (idx != _loadedIndex) {
-        await p.open(Media(d.episodes[idx]));
-        _loadedIndex = idx;
+      await p.open(Media(d.episodes[idx]), play: !resume);
+      _loadedIndex = idx;
+      if (resume) {
+        await p.seek(pos);
+        await p.play();
       }
-      if (pos > Duration.zero) await p.seek(pos);
-      await p.play();
+      _armHist();
     } catch (e) {
       _pErr.value = '$e';
     }
-    _started.value = true; // 从全屏回来通常在播，别再弹加载浮层
-    _pos.value = pos;
     _playing.value = p.state.playing;
-    _dur.value = p.state.duration;
   }
 
   Future<void> _toggleFav() async {

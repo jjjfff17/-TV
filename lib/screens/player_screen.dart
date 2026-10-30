@@ -34,6 +34,9 @@ class PlayerScreen extends StatefulWidget {
     /// 此时不传 player/controller，PlayerScreen 自己开流，退出时回传 index/进度给详情页续播。
     this.startFullscreen = false,
 
+    /// 起播定位（续播用）：开流后自动 seek 到这个位置再播。
+    this.startAt,
+
     /// 用于写入「观看记录」的条目信息（来源/片名/封面）。不传则不记录历史。
     this.item,
 
@@ -53,6 +56,9 @@ class PlayerScreen extends StatefulWidget {
 
   /// 从详情页点全屏进入：横屏上下文自建 Player+VideoController，退出回传 index/进度。
   final bool startFullscreen;
+
+  /// 起播定位（续播用）：开流后先 seek 到这里再播。
+  final Duration? startAt;
 
   /// 写入「观看记录」用的条目信息（来源/片名/封面）；为空则不记录。
   final SearchItem? item;
@@ -200,7 +206,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _subs.add(_player.stream.rate.listen((double v) => _rate = v));
 
     if (own) {
-      unawaited(_openCurrent());
+      unawaited(_startInitial());
     } else {
       _pos = _player.state.position;
       _dur = _player.state.duration;
@@ -243,14 +249,62 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void _armSlowTimer({int seconds = 10}) {
     _slowTimer?.cancel();
     _slowTimer = Timer(Duration(seconds: seconds), () {
-      if (mounted && !_started) setState(() => _slow = true);
+      if (!mounted || _started) return;
+      // 看门狗：直连一直没出画，自动切代理重试一次；
+      // 代理再等不到才提示"加载较慢"，避免永远卡在 00:00 转圈。
+      if (!_viaProxy) {
+        _viaProxy = true;
+        setState(() {
+          _error = null;
+          _started = false;
+          _slow = false;
+        });
+        _uiPos.value = Duration.zero;
+        _showHud('起播较慢，切换代理线路重试…', ms: 1600);
+        unawaited(_openCurrent());
+        _armSlowTimer(seconds: 12);
+        return;
+      }
+      setState(() => _slow = true);
     });
   }
 
-  Future<void> _openCurrent() async {
+  /// 起播：全新播放器自己开流；带 startAt 时先定位再播（从详情页续播）。
+  Future<void> _startInitial() async {
+    final Duration? at = widget.startAt;
+    final bool resume = at != null && at > const Duration(seconds: 1);
+    await _openCurrent(play: !resume);
+    if (at == null || at <= const Duration(seconds: 1)) return;
+    try {
+      await _player.seek(at);
+    } catch (_) {}
+    try {
+      await _player.play();
+    } catch (_) {}
+  }
+
+  Future<void> _openCurrent({bool play = true}) async {
     if (!mounted) return;
     final String target = _viaProxy ? Api.i.proxyUrl(_url) : _url;
-    await _player.open(Media(target));
+    try {
+      await _player.open(Media(target), play: play);
+    } catch (e) {
+      // open 抛异常时 stream.error 不一定触发，这里兜一次：直连失败切代理
+      if (!_viaProxy) {
+        _viaProxy = true;
+        setState(() {
+          _error = null;
+          _started = false;
+          _slow = false;
+        });
+        _uiPos.value = Duration.zero;
+        _showHud('直连失败，正在切换代理线路…', ms: 1600);
+        _armSlowTimer(seconds: 12);
+        await _openCurrent(play: play);
+        return;
+      }
+      if (mounted) setState(() => _error = '$e');
+    }
   }
 
   bool get _hasEpisodes => widget.episodes.length > 1;

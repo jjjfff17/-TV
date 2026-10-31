@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:screen_brightness/screen_brightness.dart';
 
 import '../api.dart';
 import '../history_store.dart';
@@ -47,7 +48,20 @@ class _DetailScreenState extends State<DetailScreen> {
   bool _controls = true;
   bool _seeking = false;
   bool _descOpen = false;
-  int _fitMode = 0; // 0=铺满(cover) 1=原始(contain)；横屏默认铺满，解决"画面不铺满"
+  int _fitMode = 0; // 0=原比例(contain, 默认) 1=自适应屏幕(智能铺满)；默认原比例
+
+  // ---------- 手势状态 ----------
+  final ValueNotifier<Duration?> _seekPreview = ValueNotifier<Duration?>(null);
+  final ValueNotifier<int> _seekDelta = ValueNotifier<int>(0); // 拖动时的相对秒数（+快进 / -快退）
+  final ValueNotifier<int> _vMode = ValueNotifier<int>(-1); // -1=无 0=音量 1=亮度
+  final ValueNotifier<double> _vValue = ValueNotifier<double>(0); // 当前音量/亮度 0..1
+  final ValueNotifier<double> _speed = ValueNotifier<double>(0); // 0=无长按变速
+  double _videoAspect = 0; // 0=未知；>0=视频宽高比（来自 videoParams）
+  double _rateBefore = 1.0;
+  Duration _dragStartPos = Duration.zero;
+  bool _vDraggingY = false; // 竖向手势是否进行中（防止复位定时误关 HUD）
+  bool _longPressing = false; // 长按变速进行中：此时竖滑改调倍速，而非音量/亮度
+  double _vStartY = 0; // 长按竖滑起点 Y，用于判断上滑(3.0x)/下滑(1.5x)
 
 
   /// 播放状态（局部刷新，不整页重建）
@@ -98,6 +112,11 @@ class _DetailScreenState extends State<DetailScreen> {
     _started.dispose();
     _slow.dispose();
     _pErr.dispose();
+    _seekPreview.dispose();
+    _seekDelta.dispose();
+    _vMode.dispose();
+    _vValue.dispose();
+    _speed.dispose();
     final Player? p = _player;
     _player = null;
     if (p != null) {
@@ -171,6 +190,20 @@ class _DetailScreenState extends State<DetailScreen> {
         return;
       }
       _pErr.value = e;
+    }));
+    // 读取视频真实宽高比，供"自适应"模式智能贴底保字幕
+    _subs.add(p.stream.videoParams.listen((VideoParams? vp) {
+      if (vp == null) return;
+      final double? asp = vp.aspect;
+      final double a = asp != null && asp > 0
+          ? asp
+          : (vp.dh != null && vp.dh! > 0 && vp.dw != null
+              ? vp.dw! / vp.dh!
+              : 0);
+      if (a > 0) {
+        _videoAspect = a;
+        if (mounted) setState(() {});
+      }
     }));
   }
 
@@ -250,6 +283,138 @@ class _DetailScreenState extends State<DetailScreen> {
     setState(() => _controls = !_controls);
     if (_controls) _armHide();
   }
+
+  // ---------- 手势：横滑拖动、竖滑音量/亮度、长按变速（2.0x / 上滑 3.0x / 下滑 1.5x） ----------
+
+  void _onHStart(DragStartDetails d) {
+    _hideTimer?.cancel();
+    setState(() {
+      _controls = true;
+      _seeking = true;
+    });
+    _dragStartPos = _pos.value;
+    _seekPreview.value = _pos.value;
+  }
+
+  void _onHUpdate(DragUpdateDetails d) {
+    final double w = MediaQuery.of(context).size.width;
+    final double frac = (d.primaryDelta ?? 0) / (w * 0.5); // 半屏滑动 ≈ 60s
+    final int deltaSec = (frac * 60).round();
+    final Duration target =
+        (_dragStartPos + Duration(seconds: deltaSec)).clamp(Duration.zero, _dur.value);
+    _seekPreview.value = target;
+    _seekDelta.value = deltaSec;
+  }
+
+  void _onHEnd(DragEndDetails d) {
+    final Duration? t = _seekPreview.value;
+    _seekPreview.value = null;
+    _seekDelta.value = 0;
+    setState(() => _seeking = false);
+    if (t != null) unawaited(_player?.seek(t));
+    _armHide();
+  }
+
+  void _onVStart(DragStartDetails d) {
+    if (_longPressing) {
+      _vStartY = d.localPosition.dy; // 长按时竖滑只调倍速，不动音量/亮度
+      return;
+    }
+    _vDraggingY = true;
+    final double w = MediaQuery.of(context).size.width;
+    _vMode.value = d.localPosition.dx < w / 2 ? 0 : 1; // 左半屏音量 / 右半屏亮度
+    if (_vMode.value == 0) {
+      _vValue.value = (_player?.volume.value ?? 100) / 100;
+    } else {
+      ScreenBrightness()
+          .application
+          .then((double b) => _vValue.value = b)
+          .catchError((Object _) {
+        _vValue.value = 1;
+      });
+    }
+  }
+
+  void _onVUpdate(DragUpdateDetails d) {
+    if (_longPressing) {
+      // 长按时竖滑：上滑→3.0x，下滑→1.5x，回正→2.0x
+      final double dy = _vStartY - d.localPosition.dy; // 向上为正
+      if (dy > 24) {
+        _setLongSpeed(3.0);
+      } else if (dy < -24) {
+        _setLongSpeed(1.5);
+      } else {
+        _setLongSpeed(2.0);
+      }
+      return;
+    }
+    final double dy = d.primaryDelta ?? 0; // 上滑为负 → 增大
+    double v = _vValue.value - dy * (_vMode.value == 0 ? 0.004 : 0.005);
+    v = v.clamp(0.0, 1.0);
+    _vValue.value = v;
+    if (_vMode.value == 0) {
+      unawaited(_player?.setVolume((v * 100).round().toDouble()));
+    } else {
+      unawaited(ScreenBrightness()
+          .setApplicationScreenBrightness(v)
+          .catchError((Object _) => null));
+    }
+  }
+
+  void _onVEnd(DragEndDetails d) {
+    if (_longPressing) return; // 倍速由长按结束统一复位
+    _vDraggingY = false;
+    Future.delayed(const Duration(milliseconds: 600), () {
+      // 仅当没有新的竖向手势开始时才复位 HUD
+      if (mounted && !_vDraggingY) _vMode.value = -1;
+    });
+  }
+
+  void _onLongStart(LongPressStartDetails d) {
+    _longPressing = true;
+    _rateBefore = _player?.rate.value ?? 1.0;
+    _vMode.value = -1; // 关掉可能已亮的音量/亮度 HUD
+    _setLongSpeed(2.0);
+  }
+
+  void _onLongEnd(LongPressEndDetails d) {
+    _longPressing = false;
+    unawaited(_player?.setRate(_rateBefore));
+    _speed.value = 0;
+  }
+
+  /// 长按变速：仅在倍率变化时调用 setRate，避免每帧重复下发。
+  void _setLongSpeed(double r) {
+    if ((_player?.rate.value ?? 1.0) != r) {
+      unawaited(_player?.setRate(r));
+    }
+    _speed.value = r;
+  }
+
+  /// 播放框宽高比：全屏=整屏；内嵌=16:9 盒子
+  double _boxAspect() {
+    final double w = MediaQuery.of(context).size.width;
+    final double h = _fullscreen ? MediaQuery.of(context).size.height : w * 9 / 16;
+    return w / h;
+  }
+
+  /// 自适应模式填充方式：视频比盒子更宽 → cover 铺满（贴底保字幕）；否则 contain 不裁切
+  BoxFit _adaptiveBoxFit() {
+    if (_videoAspect <= 0) return BoxFit.contain; // 未知宽高比时保守用原比例
+    final double boxAspect = _boxAspect();
+    return _videoAspect > boxAspect ? BoxFit.cover : BoxFit.contain;
+  }
+
+  Alignment _playerAlign() {
+    if (_fitMode == 0) return Alignment.center; // 原比例：不裁切，居中
+    // 自适应：cover 时贴底保字幕，contain 时居中
+    final double boxAspect = _boxAspect();
+    if (_videoAspect > 0 && _videoAspect > boxAspect) {
+      return Alignment.bottomCenter;
+    }
+    return Alignment.center;
+  }
+
 
   // ---------- 观看记录 ----------
 
@@ -409,7 +574,8 @@ class _DetailScreenState extends State<DetailScreen> {
               child: Video(
                 controller: _controller!,
                 controls: NoVideoControls,
-                fit: _fitMode == 0 ? BoxFit.cover : BoxFit.contain,
+                fit: _fitMode == 0 ? BoxFit.contain : _adaptiveBoxFit(),
+                alignment: _playerAlign(),
               ),
             ),
 
@@ -440,15 +606,25 @@ class _DetailScreenState extends State<DetailScreen> {
             GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: _toggleControls,
+              onHorizontalDragStart: _onHStart,
+              onHorizontalDragUpdate: _onHUpdate,
+              onHorizontalDragEnd: _onHEnd,
+              onVerticalDragStart: _onVStart,
+              onVerticalDragUpdate: _onVUpdate,
+              onVerticalDragEnd: _onVEnd,
+              onLongPressStart: _onLongStart,
+              onLongPressEnd: _onLongEnd,
               child: const SizedBox.expand(),
             ),
 
           if (playing) _playerOverlay(),
 
+          if (playing) _gestureHud(),
+
           if (!playing) _bigPlayButton(),
           if (playing && _controls) _controlsBar(),
 
-          _topBar(title, playing),
+          if (!_fullscreen || _controls) _topBar(title, playing),
         ],
       ),
     );
@@ -559,6 +735,98 @@ class _DetailScreenState extends State<DetailScreen> {
     );
   }
 
+  /// 手势浮层：拖动进度预览 / 音量亮度 / 长按倍速（与控件栏独立，不随 _controls 隐藏）
+  Widget _gestureHud() {
+    return Stack(
+      children: <Widget>[
+        ValueListenableBuilder<Duration?>(
+          valueListenable: _seekPreview,
+          builder: (BuildContext _, Duration? t, Widget? __) {
+            if (t == null) return const SizedBox.shrink();
+            final int delta = _seekDelta.value;
+            return Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xCC000000),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(
+                      delta >= 0 ? Icons.fast_forward_rounded : Icons.fast_rewind_rounded,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '${delta >= 0 ? '+' : '-'}${fmtDuration(Duration(seconds: delta.abs()))}  ${fmtDuration(t)}',
+                      style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+        ValueListenableBuilder<int>(
+          valueListenable: _vMode,
+          builder: (BuildContext _, int m, Widget? __) {
+            if (m < 0) return const SizedBox.shrink();
+            final bool isVol = m == 0;
+            return Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xCC000000),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(
+                      isVol ? Icons.volume_up_rounded : Icons.brightness_6_rounded,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    ValueListenableBuilder<double>(
+                      valueListenable: _vValue,
+                      builder: (BuildContext _, double v, Widget? ___) => Text(
+                        '${(v * 100).round()}%',
+                        style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+        ValueListenableBuilder<double>(
+          valueListenable: _speed,
+          builder: (BuildContext _, double s, Widget? __) {
+            if (s <= 0) return const SizedBox.shrink();
+            return Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xCC000000),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  '${s.toStringAsFixed(1)}x',
+                  style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700),
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+
   /// 极简控件：`播放键 + 当前时间 ──进度条── 总时长 + 全屏`（对齐 Lanerc 的 4 元素）
   Widget _controlsBar() {
     return Positioned(
@@ -651,10 +919,10 @@ class _DetailScreenState extends State<DetailScreen> {
                 ),
               ),
             ),
-                Tooltip(
-                  message: _fitMode == 0 ? '画面：铺满' : '画面：原始',
+                  Tooltip(
+                  message: _fitMode == 0 ? '画面：原比例' : '画面：自适应',
                   child: _ctlIcon(
-                    _fitMode == 0 ? Icons.fit_screen_rounded : Icons.aspect_ratio_rounded,
+                    _fitMode == 0 ? Icons.aspect_ratio_rounded : Icons.auto_awesome_rounded,
                     () {
                       setState(() => _fitMode = _fitMode == 0 ? 1 : 0);
                       _armHide();

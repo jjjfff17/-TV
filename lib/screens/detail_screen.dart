@@ -13,7 +13,6 @@ import '../mpv_tuning.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../ui.dart';
-import 'player_screen.dart';
 
 /// 详情页（对齐 Lanerc）：顶部 16:9 内嵌播放器 + 简介 + 选集 + 底部悬浮栏。
 ///
@@ -42,12 +41,14 @@ class _DetailScreenState extends State<DetailScreen> {
 
   int? _ep; // 当前集；null = 还没开始播（显示封面 + 播放键）
   int _loadedIndex = -1; // 播放器里当前已装载的集（用于判断能否直接 play）
-  bool _fullscreen = false; // 全屏时卸载本页 Video，避免抢纹理
+  bool _fullscreen = false; // 原地全屏：只放大视频盒子，不新建播放器、不重新开流
   bool _viaProxy = false;
   bool _fav = false;
   bool _controls = true;
   bool _seeking = false;
   bool _descOpen = false;
+  int _fitMode = 0; // 0=铺满(cover) 1=原始(contain)；横屏默认铺满，解决"画面不铺满"
+
 
   /// 播放状态（局部刷新，不整页重建）
   final ValueNotifier<Duration> _pos = ValueNotifier<Duration>(Duration.zero);
@@ -61,10 +62,6 @@ class _DetailScreenState extends State<DetailScreen> {
   Timer? _hideTimer;
   Timer? _slowTimer;
   Timer? _histTimer;
-
-  /// 全屏返回时暂存：当前集与进度（PlayerScreen 在 dispose 回传）
-  int _resumeIndex = 0;
-  Duration _resumePos = Duration.zero;
 
   @override
   void initState() {
@@ -84,6 +81,13 @@ class _DetailScreenState extends State<DetailScreen> {
     _slowTimer?.cancel();
     _histTimer?.cancel();
     _recordHist();
+    if (_fullscreen) {
+      // 全屏状态下页面被直接关掉时，把屏幕方向与系统栏恢复，避免下一次进来还是横屏
+      unawaited(SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+        DeviceOrientation.portraitUp,
+      ]));
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    }
     for (final StreamSubscription<dynamic> s in _subs) {
       unawaited(s.cancel());
     }
@@ -272,122 +276,47 @@ class _DetailScreenState extends State<DetailScreen> {
     ));
   }
 
-  /// 彻底释放本页播放器：取消订阅 → 等 Video 摘树 → 销毁 libmpv 实例。
+  /// 原地全屏（0.5.3 定案）：**不新建页面、不新建播放器、不重新开流**。
   ///
-  /// 必须"先放后建"：一台设备上的硬件解码器与上游流连接都是稀缺资源，
-  /// 两个 Player 同时活着时，后建的那个会开不出流（全屏页永远 00:00）。
-  Future<void> _releasePlayer() async {
-    final Player? p = _player;
-    _player = null;
-    _controller = null;
-    _loadedIndex = -1;
-    _viaProxy = false;
-    for (final StreamSubscription<dynamic> s in _subs) {
-      unawaited(s.cancel());
-    }
-    _subs.clear();
-    // 等一帧，确保 Video widget 已从树上摘掉，再销毁原生播放器
-    await Future<void>.delayed(const Duration(milliseconds: 80));
-    if (p != null) {
-      try {
-        await p.dispose();
-      } catch (_) {}
+  /// 历史教训：
+  /// - 0.5.0 把同一个 `VideoController` 挂到新路由的 `Video` 上 → 黑屏只有声音；
+  /// - 0.5.1/0.5.2 改成全屏页新建 `Player` 重新 `open()` → 聚合站 m3u8 会话只认第一条
+  ///   连接，第二条开不出来 → 全屏永远 00:00。
+  /// 现在只改布局：视频仍在同一个 `Positioned` 里、同一个 `Video` widget、同一条流，
+  /// 仅高度从 16:9 变成整屏，因此不存在重新加载，也不存在纹理重建。
+  Future<void> _toggleFullscreen() async {
+    if (_fullscreen) {
+      await _exitFullscreen();
+    } else {
+      await _enterFullscreen();
     }
   }
 
-  /// 进全屏：详情页先把播放器彻底释放（唯一播放器原则），
-  /// PlayerScreen 在横屏新建 Player+VideoController 开流（绕开共享 Surface 黑屏），
-  /// 退出后按回传的集与进度重建续播。
   Future<void> _enterFullscreen() async {
-    final VideoDetail? d = _detail;
-    final int? i = _ep;
-    if (d == null || i == null) return;
-    _hideTimer?.cancel();
-    _histTimer?.cancel();
-    _recordHist();
-    _resumeIndex = i;
-    _resumePos = _pos.value;
-    setState(() {
-      _controls = true;
-      _fullscreen = true; // 本页 Video 卸载，随后销毁纹理
-    });
-    await _releasePlayer();
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
+    await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     if (!mounted) return;
-    await Navigator.of(context).push(
-      PageRouteBuilder<void>(
-        transitionDuration: const Duration(milliseconds: 240),
-        reverseTransitionDuration: const Duration(milliseconds: 200),
-        pageBuilder: (BuildContext _, Animation<double> __, Animation<double> ___) =>
-            PlayerScreen(
-              url: d.episodes[i],
-              title: d.info.title.isNotEmpty ? d.info.title : widget.item.name,
-              episodes: d.episodes,
-              index: i,
-              sourceName: widget.item.sourceName,
-              startFullscreen: true,
-              startAt: _resumePos,
-              item: widget.item,
-              onEpisodeChanged: (int ni) {
-                if (!mounted) return;
-                setState(() => _ep = ni);
-              },
-              onExit: (int idx, Duration pos, Duration dur) {
-                _resumeIndex = idx;
-                if (pos > Duration.zero) _resumePos = pos;
-              },
-            ),
-        transitionsBuilder: (BuildContext _, Animation<double> a, Animation<double> __, Widget child) {
-          return FadeTransition(opacity: a, child: child);
-        },
-      ),
-    );
+    setState(() {
+      _fullscreen = true;
+      _controls = true;
+    });
+    _armHide();
+  }
+
+  Future<void> _exitFullscreen() async {
+    await SystemChrome.setPreferredOrientations(const <DeviceOrientation>[
+      DeviceOrientation.portraitUp,
+    ]);
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     if (!mounted) return;
     setState(() {
       _fullscreen = false;
       _controls = true;
     });
-    await _resumeFromFullscreen();
     _armHide();
-  }
-
-  /// 从全屏回来：重建本页播放器，按回传的集与进度续播
-  Future<void> _resumeFromFullscreen() async {
-    final VideoDetail? d = _detail;
-    if (d == null || d.episodes.isEmpty) return;
-    // 全屏页的 Player 是在 dispose 里异步销毁的，先让原生侧收干净，
-    // 否则新实例又要和旧实例抢解码器（同 00:00 那个坑）。
-    await Future<void>.delayed(const Duration(milliseconds: 180));
-    if (!mounted) return;
-    final int idx = _resumeIndex.clamp(0, d.episodes.length - 1).toInt();
-    final Duration pos = _resumePos;
-    _pErr.value = null;
-    _slow.value = false;
-    _started.value = false;
-    _pos.value = Duration.zero;
-    _dur.value = Duration.zero;
-    _ensurePlayer();
-    if (!mounted) return;
-    setState(() {
-      _ep = idx;
-      _controls = true;
-    });
-    _armSlow();
-    final Player? p = _player;
-    if (p == null) return;
-    final bool resume = pos > const Duration(seconds: 1);
-    try {
-      unawaited(WakelockPlus.enable());
-      await p.open(Media(d.episodes[idx]), play: !resume);
-      _loadedIndex = idx;
-      if (resume) {
-        await p.seek(pos);
-        await p.play();
-      }
-      _armHist();
-    } catch (e) {
-      _pErr.value = '$e';
-    }
-    _playing.value = p.state.playing;
   }
 
   Future<void> _toggleFav() async {
@@ -410,24 +339,51 @@ class _DetailScreenState extends State<DetailScreen> {
   @override
   Widget build(BuildContext context) {
     final bool ready = !_loading && _error == null;
-    return Scaffold(
-      backgroundColor: C.bg,
-      body: Stack(
-        children: <Widget>[
-          Column(
-            children: <Widget>[
-              _videoArea(),
-              Expanded(
-                child: _loading
-                    ? _skeletonBody()
-                    : _error != null
-                        ? _errorView()
-                        : _body(),
-              ),
-            ],
-          ),
-          if (ready) _bottomBar(),
-        ],
+    return PopScope(
+      // 全屏时拦一次返回：先退回竖屏详情，而不是直接退出整个页面
+      canPop: !_fullscreen,
+      onPopInvokedWithResult: (bool didPop, Object? result) {
+        if (!didPop && _fullscreen) unawaited(_exitFullscreen());
+      },
+      child: Scaffold(
+        backgroundColor: _fullscreen ? Colors.black : C.bg,
+        body: LayoutBuilder(
+          builder: (BuildContext _, BoxConstraints cons) {
+            // 16:9 高度恒定，内容区几何不动；全屏只把视频盒子的高度换成整屏
+            final double vh = cons.maxWidth * 9 / 16;
+            // 全屏时 maxWidth*9/16 可能大于屏高，内容区必须塌成 0 高，否则约束为负会断言崩溃
+            final double contentTop = _fullscreen ? cons.maxHeight : vh;
+            return Stack(
+              children: <Widget>[
+                // 视频层：两种模式下都是同一个 Positioned + 同一个 _videoArea()，
+                // 只改高度。Video 元素与原生纹理原地不动 → 不重新开流、不黑屏。
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  right: 0,
+                  height: _fullscreen ? cons.maxHeight : vh,
+                  child: _videoArea(),
+                ),
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  top: contentTop,
+                  bottom: 0,
+                  // Offstage 而非条件移除：保留列表滚动位置，退出全屏回到原处
+                  child: Offstage(
+                    offstage: _fullscreen,
+                    child: _loading
+                        ? _skeletonBody()
+                        : _error != null
+                            ? _errorView()
+                            : _body(),
+                  ),
+                ),
+                if (!_fullscreen && ready) _bottomBar(),
+              ],
+            );
+          },
+        ),
       ),
     );
   }
@@ -440,60 +396,60 @@ class _DetailScreenState extends State<DetailScreen> {
     final String? cover = d?.info.cover ?? widget.item.pic;
     final bool playing = _ep != null;
 
-    return AspectRatio(
-      aspectRatio: 16 / 9,
-      child: ClipRect(
-        child: Stack(
-          fit: StackFit.expand,
-          children: <Widget>[
-            const ColoredBox(color: C.darkBg),
+    return ClipRect(
+      child: Stack(
+        fit: StackFit.expand,
+        children: <Widget>[
+          const ColoredBox(color: C.darkBg),
 
-            if (playing && _controller != null && !_fullscreen)
-              RepaintBoundary(
-                child: Video(
-                  controller: _controller!,
-                  controls: NoVideoControls,
+          // 播放中始终挂这个 Video：全屏只是把它所在的盒子放大，
+          // 不做卸载/重挂 → 纹理与流都不重建。
+          if (playing && _controller != null)
+            RepaintBoundary(
+              child: Video(
+                controller: _controller!,
+                controls: NoVideoControls,
+                fit: _fitMode == 0 ? BoxFit.cover : BoxFit.contain,
+              ),
+            ),
+
+          // 尚未开播：封面（带 Hero，从列表进来时无缝放大）
+          if (!playing && cover != null && cover.isNotEmpty)
+            Hero(
+              tag: 'p_${widget.item.sourceKey}_${widget.item.vodId}',
+              child: NetImg(url: cover, memWidth: 900),
+            ),
+
+          if (!playing)
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: <Color>[
+                    Color(0x88000000),
+                    Color(0x33000000),
+                    Color(0x8C000000),
+                  ],
+                  stops: <double>[0, 0.45, 1],
                 ),
               ),
+            ),
 
-            // 尚未开播：封面（带 Hero，从列表进来时无缝放大）
-            if (!playing && cover != null && cover.isNotEmpty)
-              Hero(
-                tag: 'p_${widget.item.sourceKey}_${widget.item.vodId}',
-                child: NetImg(url: cover, memWidth: 900),
-              ),
+          if (playing)
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _toggleControls,
+              child: const SizedBox.expand(),
+            ),
 
-            if (!playing)
-              const DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: <Color>[
-                      Color(0x88000000),
-                      Color(0x33000000),
-                      Color(0x8C000000),
-                    ],
-                    stops: <double>[0, 0.45, 1],
-                  ),
-                ),
-              ),
+          if (playing) _playerOverlay(),
 
-            if (playing)
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _toggleControls,
-                child: const SizedBox.expand(),
-              ),
+          if (!playing) _bigPlayButton(),
+          if (playing && _controls) _controlsBar(),
 
-            if (playing) _playerOverlay(),
-
-            if (!playing) _bigPlayButton(),
-            if (playing && _controls) _controlsBar(),
-
-            _topBar(title, playing),
-          ],
-        ),
+          _topBar(title, playing),
+        ],
       ),
     );
   }
@@ -695,7 +651,24 @@ class _DetailScreenState extends State<DetailScreen> {
                 ),
               ),
             ),
-                _ctlIcon(Icons.fullscreen_rounded, _enterFullscreen, size: 22),
+                Tooltip(
+                  message: _fitMode == 0 ? '画面：铺满' : '画面：原始',
+                  child: _ctlIcon(
+                    _fitMode == 0 ? Icons.fit_screen_rounded : Icons.aspect_ratio_rounded,
+                    () {
+                      setState(() => _fitMode = _fitMode == 0 ? 1 : 0);
+                      _armHide();
+                    },
+                    size: 22,
+                  ),
+                ),
+                _ctlIcon(
+                  _fullscreen ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded,
+                  () {
+                    unawaited(_toggleFullscreen());
+                  },
+                  size: 22,
+                ),
               ],
             );
           },
@@ -735,7 +708,12 @@ class _DetailScreenState extends State<DetailScreen> {
             child: Row(
               children: <Widget>[
                 _topIcon(Icons.arrow_back_ios_new_rounded, () {
-                  Navigator.of(context).maybePop();
+                  // 全屏时先退回竖屏详情，非全屏才退出页面
+                  if (_fullscreen) {
+                    unawaited(_exitFullscreen());
+                  } else {
+                    Navigator.of(context).maybePop();
+                  }
                 }, size: 18),
                 const SizedBox(width: 2),
                 Expanded(

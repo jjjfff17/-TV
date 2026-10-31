@@ -59,9 +59,10 @@ class _DetailScreenState extends State<DetailScreen> {
   double _videoAspect = 0; // 0=未知；>0=视频宽高比（来自 videoParams）
   double _rateBefore = 1.0;
   Duration _dragStartPos = Duration.zero;
+  double _dragStartX = 0; // 横滑起点 X，用于累计位移（修复"有动画但进度条不走"）
   bool _vDraggingY = false; // 竖向手势是否进行中（防止复位定时误关 HUD）
-  bool _longPressing = false; // 长按变速进行中：此时竖滑改调倍速，而非音量/亮度
-  double _vStartY = 0; // 长按竖滑起点 Y，用于判断上滑(3.0x)/下滑(1.5x)
+  bool _longPressing = false; // 长按变速进行中
+  double _longStartY = 0; // 长按起点 Y，用于判断上滑(3.0x)/下滑(1.5x)
 
 
   /// 播放状态（局部刷新，不整页重建）
@@ -284,6 +285,12 @@ class _DetailScreenState extends State<DetailScreen> {
     if (_controls) _armHide();
   }
 
+  /// 双击：播放/暂停切换
+  void _togglePlayPause() {
+    if (_ep == null || _player == null) return;
+    unawaited(_player?.playOrPause() ?? Future<void>.value());
+  }
+
   // ---------- 手势：横滑拖动、竖滑音量/亮度、长按变速（2.0x / 上滑 3.0x / 下滑 1.5x） ----------
 
   void _onHStart(DragStartDetails d) {
@@ -293,15 +300,16 @@ class _DetailScreenState extends State<DetailScreen> {
       _seeking = true;
     });
     _dragStartPos = _pos.value;
+    _dragStartX = d.localPosition.dx;
     _seekPreview.value = _pos.value;
   }
 
   void _onHUpdate(DragUpdateDetails d) {
     final double w = MediaQuery.of(context).size.width;
-    final double frac = (d.primaryDelta ?? 0) / (w * 0.5); // 半屏滑动 ≈ 60s
+    // 累计位移（右滑为正=快进，左滑为负=快退），半屏 ≈ 60s
+    final double dxTotal = d.localPosition.dx - _dragStartX;
+    final double frac = dxTotal / (w * 0.5);
     final int deltaSec = (frac * 60).round();
-    // 注意：直接用 Duration.clamp 在部分 CI 的 Dart SDK 下会报 "clamp isn't defined"，
-    // 这里改写为手写钳制，跨版本稳定，且未知时长(_dur=0)时不误钳到 0。
     Duration target = _dragStartPos + Duration(seconds: deltaSec);
     if (target < Duration.zero) {
       target = Duration.zero;
@@ -310,6 +318,7 @@ class _DetailScreenState extends State<DetailScreen> {
     }
     _seekPreview.value = target;
     _seekDelta.value = deltaSec;
+    _pos.value = target; // 拖动时实时移动进度条（真正 seek 在 _onHEnd 执行）
   }
 
   void _onHEnd(DragEndDetails d) {
@@ -322,13 +331,10 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   void _onVStart(DragStartDetails d) {
-    if (_longPressing) {
-      _vStartY = d.localPosition.dy; // 长按时竖滑只调倍速，不动音量/亮度
-      return;
-    }
+    if (_longPressing) return; // 长按时由 onLongPressMoveUpdate 接管，不触发音量/亮度
     _vDraggingY = true;
     final double w = MediaQuery.of(context).size.width;
-    _vMode.value = d.localPosition.dx < w / 2 ? 0 : 1; // 左半屏音量 / 右半屏亮度
+    _vMode.value = d.localPosition.dx < w / 2 ? 1 : 0; // 左半屏亮度 / 右半屏音量
     if (_vMode.value == 0) {
       _vValue.value = (_player?.state.volume ?? 100) / 100;
     } else {
@@ -342,18 +348,7 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   void _onVUpdate(DragUpdateDetails d) {
-    if (_longPressing) {
-      // 长按时竖滑：上滑→3.0x，下滑→1.5x，回正→2.0x
-      final double dy = _vStartY - d.localPosition.dy; // 向上为正
-      if (dy > 24) {
-        _setLongSpeed(3.0);
-      } else if (dy < -24) {
-        _setLongSpeed(1.5);
-      } else {
-        _setLongSpeed(2.0);
-      }
-      return;
-    }
+    if (_longPressing) return; // 长按时由 onLongPressMoveUpdate 接管
     final double dy = d.primaryDelta ?? 0; // 上滑为负 → 增大
     double v = _vValue.value - dy * (_vMode.value == 0 ? 0.004 : 0.005);
     v = v.clamp(0.0, 1.0);
@@ -368,7 +363,6 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   void _onVEnd(DragEndDetails d) {
-    if (_longPressing) return; // 倍速由长按结束统一复位
     _vDraggingY = false;
     Future.delayed(const Duration(milliseconds: 600), () {
       // 仅当没有新的竖向手势开始时才复位 HUD
@@ -379,8 +373,22 @@ class _DetailScreenState extends State<DetailScreen> {
   void _onLongStart(LongPressStartDetails d) {
     _longPressing = true;
     _rateBefore = _player?.state.rate ?? 1.0;
+    _longStartY = d.localPosition.dy;
     _vMode.value = -1; // 关掉可能已亮的音量/亮度 HUD
     _setLongSpeed(2.0);
+  }
+
+  // 长按中上/下滑切换倍速：上滑=3.0x，回正=2.0x，下滑=1.5x。
+  // 用 onLongPressMoveUpdate 而非竖向拖拽，确保长按期间移动一定能触发。
+  void _onLongMove(LongPressMoveUpdateDetails d) {
+    final double dy = _longStartY - d.localPosition.dy; // 上滑为正
+    if (dy > 16) {
+      _setLongSpeed(3.0);
+    } else if (dy < -16) {
+      _setLongSpeed(1.5);
+    } else {
+      _setLongSpeed(2.0);
+    }
   }
 
   void _onLongEnd(LongPressEndDetails d) {
@@ -612,6 +620,7 @@ class _DetailScreenState extends State<DetailScreen> {
             GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: _toggleControls,
+              onDoubleTap: _togglePlayPause,
               onHorizontalDragStart: _onHStart,
               onHorizontalDragUpdate: _onHUpdate,
               onHorizontalDragEnd: _onHEnd,
@@ -619,6 +628,7 @@ class _DetailScreenState extends State<DetailScreen> {
               onVerticalDragUpdate: _onVUpdate,
               onVerticalDragEnd: _onVEnd,
               onLongPressStart: _onLongStart,
+              onLongPressMoveUpdate: _onLongMove,
               onLongPressEnd: _onLongEnd,
               child: const SizedBox.expand(),
             ),

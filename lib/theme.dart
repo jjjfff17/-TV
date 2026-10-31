@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 /// App 自身版本号（必须与 pubspec.yaml 的 version 保持一致，改版本时两处一起改）。
 /// 不做成运行时读取：少一个依赖，也避免构建期读不到而显示空。
-const String kAppVersion = '0.5.5+13';
+const String kAppVersion = '0.5.6+14';
 
 /// 设计基线：Lanerc 风格 —— 浅色底 + 青色强调 + 圆润卡片 + 轻描边。
 /// 与 0.4.x 的变化：主色由蓝(#2F6BFF)改为青(#13BFD2)，整体更干净。

@@ -300,8 +300,14 @@ class _DetailScreenState extends State<DetailScreen> {
     final double w = MediaQuery.of(context).size.width;
     final double frac = (d.primaryDelta ?? 0) / (w * 0.5); // 半屏滑动 ≈ 60s
     final int deltaSec = (frac * 60).round();
-    final Duration target =
-        (_dragStartPos + Duration(seconds: deltaSec)).clamp(Duration.zero, _dur.value);
+    // 注意：直接用 Duration.clamp 在部分 CI 的 Dart SDK 下会报 "clamp isn't defined"，
+    // 这里改写为手写钳制，跨版本稳定，且未知时长(_dur=0)时不误钳到 0。
+    Duration target = _dragStartPos + Duration(seconds: deltaSec);
+    if (target < Duration.zero) {
+      target = Duration.zero;
+    } else if (_dur.value > Duration.zero && target > _dur.value) {
+      target = _dur.value;
+    }
     _seekPreview.value = target;
     _seekDelta.value = deltaSec;
   }
@@ -324,7 +330,7 @@ class _DetailScreenState extends State<DetailScreen> {
     final double w = MediaQuery.of(context).size.width;
     _vMode.value = d.localPosition.dx < w / 2 ? 0 : 1; // 左半屏音量 / 右半屏亮度
     if (_vMode.value == 0) {
-      _vValue.value = (_player?.volume.value ?? 100) / 100;
+      _vValue.value = (_player?.state.volume ?? 100) / 100;
     } else {
       ScreenBrightness()
           .application
@@ -372,7 +378,7 @@ class _DetailScreenState extends State<DetailScreen> {
 
   void _onLongStart(LongPressStartDetails d) {
     _longPressing = true;
-    _rateBefore = _player?.rate.value ?? 1.0;
+    _rateBefore = _player?.state.rate ?? 1.0;
     _vMode.value = -1; // 关掉可能已亮的音量/亮度 HUD
     _setLongSpeed(2.0);
   }
@@ -385,7 +391,7 @@ class _DetailScreenState extends State<DetailScreen> {
 
   /// 长按变速：仅在倍率变化时调用 setRate，避免每帧重复下发。
   void _setLongSpeed(double r) {
-    if ((_player?.rate.value ?? 1.0) != r) {
+    if ((_player?.state.rate ?? 1.0) != r) {
       unawaited(_player?.setRate(r));
     }
     _speed.value = r;

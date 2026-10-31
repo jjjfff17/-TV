@@ -2,15 +2,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:media_kit/media_kit.dart';
-import 'package:media_kit_video/media_kit_video.dart';
+import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:screen_brightness/screen_brightness.dart';
 
 import '../api.dart';
 import '../history_store.dart';
 import '../models.dart';
-import '../mpv_tuning.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../ui.dart';
@@ -35,10 +33,8 @@ class _DetailScreenState extends State<DetailScreen> {
   String? _error;
   bool _loading = true;
 
-  // ---------- 内嵌播放器 ----------
-  Player? _player;
-  VideoController? _controller;
-  final List<StreamSubscription<dynamic>> _subs = <StreamSubscription<dynamic>>[];
+  // ---------- 内嵌播放器（video_player / ExoPlayer：原生分段流，拖动秒开） ----------
+  VideoPlayerController? _player;
 
   int? _ep; // 当前集；null = 还没开始播（显示封面 + 播放键）
   int _loadedIndex = -1; // 播放器里当前已装载的集（用于判断能否直接 play）
@@ -56,7 +52,7 @@ class _DetailScreenState extends State<DetailScreen> {
   final ValueNotifier<int> _vMode = ValueNotifier<int>(-1); // -1=无 0=音量 1=亮度
   final ValueNotifier<double> _vValue = ValueNotifier<double>(0); // 当前音量/亮度 0..1
   final ValueNotifier<double> _speed = ValueNotifier<double>(0); // 0=无长按变速
-  double _videoAspect = 0; // 0=未知；>0=视频宽高比（来自 videoParams）
+  double _videoAspect = 0; // 0=未知；>0=视频宽高比（来自控制器 value.aspectRatio）
   double _rateBefore = 1.0;
   Duration _dragStartPos = Duration.zero;
   double _dragStartX = 0; // 横滑起点 X，用于累计位移（修复"有动画但进度条不走"）
@@ -103,9 +99,6 @@ class _DetailScreenState extends State<DetailScreen> {
       ]));
       unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     }
-    for (final StreamSubscription<dynamic> s in _subs) {
-      unawaited(s.cancel());
-    }
     _pos.dispose();
     _dur.dispose();
     _playing.dispose();
@@ -118,7 +111,7 @@ class _DetailScreenState extends State<DetailScreen> {
     _vMode.dispose();
     _vValue.dispose();
     _speed.dispose();
-    final Player? p = _player;
+    final VideoPlayerController? p = _player;
     _player = null;
     if (p != null) {
       unawaited(WakelockPlus.disable());
@@ -150,94 +143,116 @@ class _DetailScreenState extends State<DetailScreen> {
     }
   }
 
-  // ---------------- 播放器 ----------------
+  // ---------------- 播放器（video_player / ExoPlayer：原生分段流，拖动秒开） ----------------
 
-  void _ensurePlayer() {
-    if (_player != null) return;
-    final Player p = Player();
-    _player = p;
-    applyMpvTuning(p);
-    _controller = VideoController(
-      p,
-      configuration: const VideoControllerConfiguration(
-        enableHardwareAcceleration: true,
-      ),
+  int _reqSeq = 0; // 播放请求序号：防止预载与换集并发时互相覆盖
+
+  /// 创建并初始化一个控制器；play=false 用于预载（只装载不播）。
+  /// 直连失败自动走代理兜底一次（_viaProxy 防止死循环）。
+  Future<void> _attach(String url, {bool play = true, int seq = 0}) async {
+    final VideoPlayerController c = VideoPlayerController.networkUrl(
+      Uri.parse(url),
+      videoPlayerOptions: const VideoPlayerOptions(mixWithOthers: false),
     );
-
-    _subs.add(p.stream.position.listen((Duration v) {
-      if (!_seeking) _pos.value = v;
-      // 出画判据 = 时间轴开始前进（libmpv 的 playing 在首帧前就为 true）
-      if (!_started.value && v > const Duration(milliseconds: 250)) {
-        _started.value = true;
-        _slow.value = false;
-        _slowTimer?.cancel();
-      }
-    }));
-    _subs.add(p.stream.duration.listen((Duration v) => _dur.value = v));
-    _subs.add(p.stream.playing.listen((bool v) {
-      _playing.value = v;
-      if (v) _armHide();
-    }));
-    _subs.add(p.stream.buffering.listen((bool v) => _buffering.value = v));
-    _subs.add(p.stream.error.listen((String e) {
+    c.addListener(_onTick);
+    try {
+      await c.initialize();
+    } catch (e) {
       if (!_viaProxy) {
+        // 直连失败 → 代理兜底（仅一次）
         _viaProxy = true;
-        _started.value = false;
-        _slow.value = false;
-        _pErr.value = null;
-        _pos.value = Duration.zero;
-        _armSlow(seconds: 12);
-        unawaited(_reopenViaProxy());
+        unawaited(c.dispose());
+        final VideoPlayerController c2 = VideoPlayerController.networkUrl(
+          Uri.parse(Api.i.proxyUrl(url)),
+          videoPlayerOptions: const VideoPlayerOptions(mixWithOthers: false),
+        );
+        c2.addListener(_onTick);
+        try {
+          await c2.initialize();
+        } catch (e2) {
+          unawaited(c2.dispose());
+          _pErr.value = '$e2';
+          return;
+        }
+        if (seq != 0 && seq != _reqSeq) {
+          unawaited(c2.dispose());
+          return;
+        }
+        _replacePlayer(c2);
+        if (mounted) setState(() {});
+        if (play) await _startPlay();
         return;
       }
-      _pErr.value = e;
-    }));
-    // 读取视频真实宽高比，供"自适应"模式智能贴底保字幕
-    _subs.add(p.stream.videoParams.listen((VideoParams? vp) {
-      if (vp == null) return;
-      final double? asp = vp.aspect;
-      final double a = asp != null && asp > 0
-          ? asp
-          : (vp.dh != null && vp.dh! > 0 && vp.dw != null
-              ? vp.dw! / vp.dh!
-              : 0);
-      if (a > 0) {
+      _pErr.value = '$e';
+      return;
+    }
+    if (seq != 0 && seq != _reqSeq) {
+      unawaited(c.dispose());
+      return;
+    }
+    _replacePlayer(c);
+    if (mounted) setState(() {});
+    if (play) await _startPlay();
+  }
+
+  void _replacePlayer(VideoPlayerController next) {
+    final VideoPlayerController? old = _player;
+    _player = next;
+    if (old != null && old != next) {
+      unawaited(old.dispose());
+    }
+  }
+
+  Future<void> _startPlay() async {
+    await _player?.play();
+    unawaited(WakelockPlus.enable());
+    _armHist();
+  }
+
+  /// 统一从控制器 value 同步到各 ValueNotifier（video_player 用 addListener 而非流）。
+  void _onTick() {
+    final VideoPlayerController? p = _player;
+    if (p == null || !p.value.isInitialized) return;
+    if (!_seeking) _pos.value = p.value.position;
+    _dur.value = p.value.duration;
+    _playing.value = p.value.isPlaying;
+    _buffering.value = p.value.isBuffering;
+    if (p.value.aspectRatio > 0) {
+      final double a = p.value.aspectRatio;
+      if ((_videoAspect - a).abs() > 0.01) {
         _videoAspect = a;
         if (mounted) setState(() {});
       }
-    }));
+    }
+    // 出画判据：时间轴开始前进
+    if (!_started.value && p.value.position > const Duration(milliseconds: 250)) {
+      _started.value = true;
+      _slow.value = false;
+      _slowTimer?.cancel();
+    }
+    if (p.value.hasError && _pErr.value == null) {
+      _pErr.value = p.value.errorDescription ?? '播放出错';
+    }
   }
 
   Future<void> _preload() async {
     final VideoDetail? d = _detail;
     if (d == null || d.episodes.isEmpty) return;
-    _ensurePlayer();
     if (_loadedIndex >= 0) return;
+    final int seq = ++_reqSeq;
     try {
-      await _player!.open(Media(d.episodes[0]), play: false);
-      _loadedIndex = 0;
+      await _attach(d.episodes[0], play: false, seq: seq);
+      if (seq == _reqSeq) _loadedIndex = 0;
     } catch (_) {
-      // 预载失败不影响正常播放，点播放键时会重新 open
+      // 预载失败不影响正常播放，点播放键时会重新 attach
     }
   }
 
-  Future<void> _reopenViaProxy() async {
-    final VideoDetail? d = _detail;
-    final int? i = _ep;
-    if (d == null || i == null || i >= d.episodes.length) return;
-    try {
-      await _player?.open(Media(Api.i.proxyUrl(d.episodes[i])));
-      _loadedIndex = i;
-      await _player?.play();
-    } catch (e) {
-      _pErr.value = '$e';
-    }
-  }
+  // 代理兜底逻辑已并入 _attach（直连失败自动走 Api.i.proxyUrl 重试一次）。
 
   Future<void> _openEpisode(int i) async {
     final VideoDetail? d = _detail;
     if (d == null || i < 0 || i >= d.episodes.length) return;
-    _ensurePlayer();
     unawaited(HapticFeedback.selectionClick());
     setState(() {
       _ep = i;
@@ -251,15 +266,15 @@ class _DetailScreenState extends State<DetailScreen> {
     _viaProxy = false;
     _armSlow();
     _armHide();
+    final int seq = ++_reqSeq;
+    // 已装载同一集且未出错：直接播放（不重新开流）；否则重建控制器
+    if (_loadedIndex == i && _player != null && !_player!.value.hasError) {
+      unawaited(_startPlay());
+      return;
+    }
     try {
-      if (_loadedIndex == i) {
-        await _player!.play();
-      } else {
-        await _player!.open(Media(d.episodes[i]));
-        _loadedIndex = i;
-      }
-      unawaited(WakelockPlus.enable());
-      _armHist();
+      await _attach(d.episodes[i], play: true, seq: seq);
+      if (seq == _reqSeq) _loadedIndex = i;
     } catch (e) {
       _pErr.value = '$e';
     }
@@ -286,9 +301,19 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   /// 双击：播放/暂停切换
-  void _togglePlayPause() {
-    if (_ep == null || _player == null) return;
-    unawaited(_player?.playOrPause() ?? Future<void>.value());
+  Future<void> _togglePlayPause() async {
+    if (_ep == null) return;
+    await _playOrPause();
+  }
+
+  Future<void> _playOrPause() async {
+    final VideoPlayerController? p = _player;
+    if (p == null || !p.value.isInitialized) return;
+    if (p.value.isPlaying) {
+      await p.pause();
+    } else {
+      await p.play();
+    }
   }
 
   // ---------- 手势：横滑拖动、竖滑音量/亮度、长按变速（2.0x / 上滑 3.0x / 下滑 1.5x） ----------
@@ -326,7 +351,7 @@ class _DetailScreenState extends State<DetailScreen> {
     _seekPreview.value = null;
     _seekDelta.value = 0;
     setState(() => _seeking = false);
-    if (t != null) unawaited(_player?.seek(t));
+    if (t != null) unawaited(_player?.seekTo(t));
     _armHide();
   }
 
@@ -336,7 +361,7 @@ class _DetailScreenState extends State<DetailScreen> {
     final double w = MediaQuery.of(context).size.width;
     _vMode.value = d.localPosition.dx < w / 2 ? 1 : 0; // 左半屏亮度 / 右半屏音量
     if (_vMode.value == 0) {
-      _vValue.value = (_player?.state.volume ?? 100) / 100;
+      _vValue.value = _player?.value.volume ?? 1.0;
     } else {
       ScreenBrightness()
           .application
@@ -354,7 +379,7 @@ class _DetailScreenState extends State<DetailScreen> {
     v = v.clamp(0.0, 1.0);
     _vValue.value = v;
     if (_vMode.value == 0) {
-      unawaited(_player?.setVolume((v * 100).round().toDouble()));
+      unawaited(_player?.setVolume(v));
     } else {
       unawaited(ScreenBrightness()
           .setApplicationScreenBrightness(v)
@@ -372,7 +397,7 @@ class _DetailScreenState extends State<DetailScreen> {
 
   void _onLongStart(LongPressStartDetails d) {
     _longPressing = true;
-    _rateBefore = _player?.state.rate ?? 1.0;
+    _rateBefore = _player?.value.playbackSpeed ?? 1.0;
     _longStartY = d.localPosition.dy;
     _vMode.value = -1; // 关掉可能已亮的音量/亮度 HUD
     _setLongSpeed(2.0);
@@ -393,14 +418,14 @@ class _DetailScreenState extends State<DetailScreen> {
 
   void _onLongEnd(LongPressEndDetails d) {
     _longPressing = false;
-    unawaited(_player?.setRate(_rateBefore));
+    unawaited(_player?.setPlaybackSpeed(_rateBefore));
     _speed.value = 0;
   }
 
   /// 长按变速：仅在倍率变化时调用 setRate，避免每帧重复下发。
   void _setLongSpeed(double r) {
-    if ((_player?.state.rate ?? 1.0) != r) {
-      unawaited(_player?.setRate(r));
+    if ((_player?.value.playbackSpeed ?? 1.0) != r) {
+      unawaited(_player?.setPlaybackSpeed(r));
     }
     _speed.value = r;
   }
@@ -574,6 +599,7 @@ class _DetailScreenState extends State<DetailScreen> {
         : widget.item.name;
     final String? cover = d?.info.cover ?? widget.item.pic;
     final bool playing = _ep != null;
+    final bool hasVid = _player != null && _player!.value.isInitialized;
 
     return ClipRect(
       child: Stack(
@@ -583,13 +609,18 @@ class _DetailScreenState extends State<DetailScreen> {
 
           // 播放中始终挂这个 Video：全屏只是把它所在的盒子放大，
           // 不做卸载/重挂 → 纹理与流都不重建。
-          if (playing && _controller != null)
+          if (hasVid)
             RepaintBoundary(
-              child: Video(
-                controller: _controller!,
-                controls: NoVideoControls,
-                fit: _fitMode == 0 ? BoxFit.contain : _adaptiveBoxFit(),
-                alignment: _playerAlign(),
+              child: ClipRect(
+                child: FittedBox(
+                  fit: _fitMode == 0 ? BoxFit.contain : _adaptiveBoxFit(),
+                  alignment: _playerAlign(),
+                  child: SizedBox(
+                    width: 1000,
+                    height: _videoAspect > 0 ? 1000 / _videoAspect : 1000 * 9 / 16,
+                    child: VideoPlayer(_player!),
+                  ),
+                ),
               ),
             ),
 
@@ -871,7 +902,7 @@ class _DetailScreenState extends State<DetailScreen> {
               builder: (BuildContext _, bool p, Widget? __) => _ctlIcon(
                 p ? Icons.pause_rounded : Icons.play_arrow_rounded,
                 () {
-                  unawaited(_player?.playOrPause() ?? Future<void>.value());
+                  unawaited(_playOrPause());
                   _armHide();
                 },
               ),
@@ -916,7 +947,7 @@ class _DetailScreenState extends State<DetailScreen> {
                       onChangeEnd: (double v) async {
                         final Duration t = Duration(milliseconds: v.round());
                         setState(() => _seeking = false);
-                        await _player?.seek(t);
+                        await _player?.seekTo(t);
                         _armHide();
                       },
                     ),
